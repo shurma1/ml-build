@@ -1,0 +1,14 @@
+# core-api: основной сервер без GPU.
+# Моделей здесь нет и быть не должно — ни torch, ни sentence-transformers:
+# всё это живёт на gpu-шлюзе и вызывается по HTTP. Единственное исключение —
+# tools/stub_gateway.py, дублёр шлюза для локальных прогонов (см. requirements-dev.txt).
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+websockets>=12.0
+psycopg[binary]>=3.2
+psycopg_pool>=3.2
+pgvector>=0.3
+numpy>=1.26
+# нужен embending/v2: facets.py приводит топонимы стеммером
+nltk>=3.8

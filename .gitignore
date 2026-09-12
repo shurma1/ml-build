@@ -1,0 +1,29 @@
+# Окружения. В "sber ctc/.venv" почти семнадцать тысяч файлов —
+# в репозиторий им нельзя.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Локальное
+.DS_Store
+*.log
+*.tsv
+/private/
+.idea/
+.vscode/
+
+# Веса и кэши моделей — качаются при старте, в репозиторий не кладутся
+hf/
+*.safetensors
+*.bin
+*.onnx
+
+# Секреты
+.env
+.gw_token
+*.pem
+*.key
+!*.pub

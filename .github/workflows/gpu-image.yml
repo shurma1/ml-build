@@ -1,0 +1,179 @@
+# Сборка и публикация образа gpu-gateway.
+#
+# Зачем CI вместо локальной сборки: единственное узкое место — канал до PyPI.
+# На макбуке колёса CUDA идут по 0.6 МБ/с, и сборка занимает два с половиной
+# часа; на раннере GitHub канал дата-центровый и та же работа укладывается
+# в 15 минут. Плюс QEMU не нужен — раннер и так x86.
+#
+# Секреты репозитория:
+#   DOCKERHUB_USERNAME — логин Docker Hub
+#   DOCKERHUB_TOKEN    — access token с правами Read & Write (НЕ пароль)
+
+name: Образ gpu-gateway
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег образа"
+        required: true
+        default: "runpod-v3"
+      also_latest:
+        description: "Обновить также :latest"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - "gpu/**"
+      - ".github/workflows/gpu-image.yml"
+
+# Две сборки разом подрались бы за кэш в реестре. Начатую заливку не рвём:
+# оборванный push оставляет в реестре недописанные слои.
+concurrency:
+  group: gpu-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: reassel/mfc-gpu-gateway
+
+jobs:
+  tests:
+    name: Контрактные тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # httpx нужен тестам про сверку цитат; тяжёлых зависимостей они не тянут
+      - run: pip install --quiet pytest httpx
+
+      # Восемь проверок того, что ломается МОЛЧА: промпт только дописывается,
+      # перечисления на месте дословно, документ идёт раньше вопроса, префикс
+      # входит в отпечаток, выдуманная цитата не доходит до оператора.
+      # Двадцать секунд здесь дешевле, чем двадцать минут сборки впустую.
+      - run: python -m pytest gpu/tests -q
+
+      # Копии схемы извлечения обязаны совпадать с оригиналом в v2/
+      - name: Копии в vendor не разъехались с оригиналом
+        run: |
+          cd gpu/gateway/vendor
+          while read -r name sha; do
+            actual=$(sha256sum "$name" | cut -d' ' -f1)
+            if [ "$actual" != "$sha" ]; then
+              echo "::error::$name разошёлся с MANIFEST — запустите gpu/sync_vendor.sh"
+              exit 1
+            fi
+          done < MANIFEST
+          echo "копии совпадают с манифестом"
+
+  build:
+    name: Сборка и публикация
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Раннер отдаёт около 14 ГБ свободными, а распакованный образ ~16 ГБ.
+      # Сносим то, что нам заведомо не нужно, и получаем запас втрое.
+      - name: Освободить диск
+        run: |
+          echo "было:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/powershell /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "стало:"; df -h / | tail -1
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Определить теги
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="ci-${GITHUB_SHA::7}"
+          TAGS="$IMAGE:$TAG"
+          if [ "${{ github.event.inputs.also_latest }}" != "false" ]; then
+            TAGS="$TAGS,$IMAGE:latest"
+          fi
+          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
+      # Кэш держим в реестре, а не в кэше Actions: тот ограничен 10 ГБ на
+      # репозиторий, а один слой с torch и библиотеками CUDA уже больше.
+      # provenance выключен — иначе к образу цепляется лишний манифест
+      # с аттестацией, и `docker manifest inspect` показывает индекс вместо образа.
+      - name: Собрать и запушить
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./gpu
+          file: ./gpu/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          provenance: false
+
+      # Проверка ровно того, что однажды уже сломалось: первый образ собирался
+      # от vastai/base-image и молча унаследовал ЧУЖОЙ entrypoint, из-за чего
+      # на RunPod не выполнялась команда запуска. Ошибка обнаружилась только
+      # на оплаченной машине.
+      - name: Проверить опубликованный образ
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          image, tag = os.environ["IMAGE"], os.environ["TAG"]
+          tok = json.loads(subprocess.run(
+              ["curl", "-s", f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image}:pull"],
+              capture_output=True, text=True).stdout)["token"]
+          ACC = ",".join(["application/vnd.oci.image.index.v1+json",
+                          "application/vnd.docker.distribution.manifest.list.v2+json",
+                          "application/vnd.oci.image.manifest.v1+json",
+                          "application/vnd.docker.distribution.manifest.v2+json"])
+          B = f"https://registry-1.docker.io/v2/{image}"
+          def get(path, accept=ACC):
+              return json.loads(subprocess.run(
+                  ["curl", "-sL", "-H", f"Authorization: Bearer {tok}", "-H", f"Accept: {accept}",
+                   f"{B}/{path}"], capture_output=True, text=True).stdout)
+          m = get(f"manifests/{tag}")
+          if "manifests" in m:
+              m = get("manifests/" + [x for x in m["manifests"]
+                      if (x.get("platform") or {}).get("architecture") == "amd64"][0]["digest"])
+          size = sum(l["size"] for l in m.get("layers", []))
+          cfg = get("blobs/" + m["config"]["digest"], "*/*").get("config", {})
+          env = dict(e.split("=", 1) for e in (cfg.get("Env") or []) if "=" in e)
+
+          problems = []
+          if cfg.get("Entrypoint") != ["/opt/mfc/entrypoint.sh"]:
+              problems.append(f"чужой Entrypoint: {cfg.get('Entrypoint')}")
+          if "10100/tcp" not in (cfg.get("ExposedPorts") or {}):
+              problems.append("порт 10100 не открыт")
+          for k, v in (("HF_HOME", "/workspace/hf"), ("GW_PORT", "10100"),
+                       ("MFC_VENV", "/opt/mfc/venv")):
+              if env.get(k) != v:
+                  problems.append(f"{k}={env.get(k)}, ожидалось {v}")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"## `{image}:{tag}`\n\n")
+              f.write(f"* размер (сжато): **{size/2**30:.2f} ГБ**, слоёв {len(m.get('layers', []))}\n")
+              f.write(f"* Entrypoint: `{cfg.get('Entrypoint')}`\n")
+              f.write(f"* digest: `{m['config']['digest'][:26]}…`\n\n")
+              f.write("Проблем не найдено.\n" if not problems
+                      else "**Проблемы:**\n" + "".join(f"* {p}\n" for p in problems))
+          for p in problems:
+              print(f"::error::{p}")
+          sys.exit(1 if problems else 0)
+          PY

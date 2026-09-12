@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8.0
+# только для tools/stub_gateway.py: он поднимает настоящий эмбеддер на CPU,
+# чтобы приёмочные метрики считались на тех же векторах, что в проде
+sentence-transformers>=3.0

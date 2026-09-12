@@ -1,0 +1,654 @@
+openapi: 3.1.0
+info:
+  title: МФЦ Поиск — core-api
+  version: 1.0.0
+  description: |
+    Публичный API для рабочего места оператора МФЦ. Живёт на основном сервере без GPU,
+    владеет Postgres+pgvector, состоянием диалога и всей бизнес-логикой.
+    Модели (ASR, эмбеддер, LLM) вызывает через gpu-gateway — см. `gpu-gateway.yaml`.
+
+    Инвариант: **право на услугу проверяется ПОСЛЕ поиска, никогда вместо него.**
+    Услуга, на которую клиент не имеет права, обязана быть найдена и показана
+    со статусом `blocked` и дословной цитатой из регламента.
+
+    Второй инвариант: **LLM не выносит вердикт о праве.** Вердикт считает
+    детерминированная таблица предикатов; LLM только проговаривает его словами.
+servers:
+  - url: https://mfc.example.ru/api
+    description: основной сервер
+security:
+  - bearerAuth: []
+tags:
+  - name: sessions
+    description: диалог оператора с посетителем
+  - name: search
+    description: разовый поиск без сессии
+  - name: services
+    description: карточки услуг и вопросы по документу
+  - name: reference
+    description: справочники и состояние системы
+
+paths:
+  /v1/sessions:
+    post:
+      tags: [sessions]
+      summary: Открыть сессию обслуживания
+      description: |
+        Возвращает `ws_url` — WebSocket для аудио и событий. Филиал оператора
+        становится источником муниципалитета по умолчанию: оператор в Щёкино
+        не печатает слово «Щёкино», карточка выбирается сама.
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [branch_id, operator_id]
+              properties:
+                branch_id:  { type: string, example: "br-028" }
+                operator_id: { type: string, example: "op-1174" }
+                window:     { type: integer, description: номер окна, nullable: true }
+      responses:
+        '201':
+          description: сессия создана
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, ws_url, municipality]
+                properties:
+                  session_id:   { type: string, format: uuid }
+                  ws_url:       { type: string, format: uri }
+                  municipality: { type: string, nullable: true, description: выведен из адреса филиала }
+                  corpus_version: { $ref: '#/components/schemas/CorpusVersion' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/sessions/{session_id}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      tags: [sessions]
+      summary: Текущее состояние сессии
+      description: Полный снимок — для восстановления UI после обрыва WebSocket.
+      operationId: getSession
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string, format: uuid }
+                  branch_id:  { type: string }
+                  started_at: { type: string, format: date-time }
+                  turns:      { type: array, items: { $ref: '#/components/schemas/Turn' } }
+                  state:      { $ref: '#/components/schemas/DialogState' }
+                  search:     { $ref: '#/components/schemas/SearchResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sessions/{session_id}/stream:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      tags: [sessions]
+      summary: "WebSocket: аудио вверх, события вниз (описание протокола)"
+      description: |
+        Не HTTP-эндпойнт. Документируется здесь, потому что OpenAPI не описывает WebSocket.
+
+        **Вверх (binary):** сырой PCM `s16le`, 16 кГц, моно, кадры по 20–40 мс.
+        **Вверх (text):** управляющие команды JSON — `{"type":"pause"}`, `{"type":"resume"}`.
+
+        **Вниз (text, JSON):** одно событие на сообщение, поле `type` различает:
+
+        | type | payload | когда |
+        |---|---|---|
+        | `session.ready` | `{corpus_version, models}` | после установки соединения |
+        | `transcript.utterance` | `Utterance` | VAD закрыл реплику и ASR её расшифровал |
+        | `state.updated` | `{state, changed, missing_facts}` | LLM извлекла факты и они слились в состояние |
+        | `results.updated` | `SearchResponse` | пересчитан список услуг |
+        | `degraded` | `{reason, mode}` | gpu-gateway недоступен, работаем на лексике |
+        | `error` | `Error` | ошибка, сессия жива |
+
+        Порядок гарантирован в пределах `seq`. Клиент обязан пережить пропуск
+        `transcript.utterance` (сегмент мог быть отброшен как устаревший).
+      responses:
+        '101': { description: Switching Protocols }
+
+  /v1/sessions/{session_id}/turns:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      tags: [sessions]
+      summary: Ручной ввод реплики оператором
+      description: |
+        Запасной путь, когда голос не распознался или микрофона нет. Обрабатывается
+        тем же конвейером, что и реплика от ASR; в логе помечается `source: operator_typed`.
+      operationId: addTurn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:    { type: string, maxLength: 2000 }
+                speaker: { $ref: '#/components/schemas/Speaker' }
+      responses:
+        '200':
+          description: реплика принята, состояние и результаты пересчитаны
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  turn:   { $ref: '#/components/schemas/Turn' }
+                  state:  { $ref: '#/components/schemas/DialogState' }
+                  search: { $ref: '#/components/schemas/SearchResponse' }
+
+  /v1/sessions/{session_id}/answers:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      tags: [sessions]
+      summary: Ответы на наводящие вопросы
+      description: |
+        `key` берётся из `SearchResponse.questions[].key`. Ответ **переранжирует**
+        кандидатов, а не фильтрует их: жёсткая фильтрация измерена и хуже
+        (R@1 0.775 против 0.810), потому что навсегда выбрасывает цель,
+        у которой признак услуги просто не заполнен.
+      operationId: answerQuestions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answers]
+              properties:
+                answers:
+                  type: array
+                  items:
+                    type: object
+                    required: [key, value]
+                    properties:
+                      key:   { type: string, example: "выплата" }
+                      value: { oneOf: [{type: boolean}, {type: string}] }
+      responses:
+        '200':
+          description: список пересчитан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+
+  /v1/sessions/{session_id}/facts:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      tags: [sessions]
+      summary: Оператор правит факты вручную
+      description: |
+        Главная страховка от ошибок атрибуции ролей: диаризации нет, роль говорящего
+        выводит LLM, и она может приписать клиенту то, что сказал оператор
+        («у вас двое детей?» → `children: 2`).
+
+        Выставленное здесь поле **закрепляется** (`pinned`) и больше не
+        перезаписывается извлечением из речи до явного снятия через `unpin`.
+      operationId: setFacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                set:
+                  type: object
+                  description: поля DialogState, выставляемые вручную
+                  properties:
+                    age:          { type: integer, minimum: 0, maximum: 120, nullable: true }
+                    children:     { type: integer, minimum: 0, maximum: 15, nullable: true }
+                    categories:   { type: array, items: { $ref: '#/components/schemas/Category' } }
+                    recipient:    { $ref: '#/components/schemas/Recipient' }
+                    municipality: { type: string, nullable: true }
+                    life_situation: { type: string, nullable: true }
+                unpin:
+                  type: array
+                  items: { type: string }
+                  description: снять ручное закрепление с этих полей
+      responses:
+        '200':
+          description: состояние обновлено, право пересчитано
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:  { $ref: '#/components/schemas/DialogState' }
+                  search: { $ref: '#/components/schemas/SearchResponse' }
+
+  /v1/sessions/{session_id}/close:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      tags: [sessions]
+      summary: Закрыть сессию и зафиксировать исход
+      description: |
+        `chosen_service_id` — то, ради чего пилот вообще запускается. Пара
+        «признаки диалога → выбранная оператором услуга» это неявная разметка
+        релевантности, то есть живой лог, которого сейчас нет и без которого
+        реальный R@1 известен только полосой 0.70–0.80.
+      operationId: closeSession
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                chosen_service_id: { type: string, nullable: true }
+                outcome:
+                  type: string
+                  enum: [served, not_found, wrong_branch, refused, abandoned]
+                operator_note: { type: string, maxLength: 500 }
+      responses:
+        '204': { description: закрыта }
+
+  /v1/search:
+    post:
+      tags: [search]
+      summary: Разовый поиск без сессии
+      description: Для строки поиска в UI и для регрессионных прогонов.
+      operationId: search
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text:      { type: string, description: свободный текст; фасеты доберёт газеттир }
+                features:  { $ref: '#/components/schemas/QueryFeatures' }
+                branch_id: { type: string, nullable: true }
+                k:         { type: integer, default: 8, minimum: 1, maximum: 30 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+        '503': { $ref: '#/components/responses/Degraded' }
+
+  /v1/services/{service_id}:
+    parameters:
+      - name: service_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: session_id
+        in: query
+        schema: { type: string, format: uuid }
+        description: если указан — карточка вернётся с подсветкой под факты этой сессии
+    get:
+      tags: [services]
+      summary: Карточка услуги с подсветкой
+      operationId: getService
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceCard' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/services/{service_id}/ask:
+    parameters:
+      - name: service_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [services]
+      summary: Вопрос оператора по документу услуги (SSE)
+      description: |
+        Обычный чат с LLM, но строго заземлённый на одну карточку: модель отвечает
+        только тем, что есть в регламенте, и обязана приложить дословную цитату.
+        Чего в карточке нет — «в регламенте не указано», без догадок.
+
+        Ответ — `text/event-stream`. События: `delta` (кусок текста),
+        `citation` (найденная цитата с полем и смещениями), `done`.
+      operationId: askService
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question: { type: string, maxLength: 1000 }
+                session_id: { type: string, format: uuid, nullable: true }
+                history:
+                  type: array
+                  maxItems: 20
+                  items:
+                    type: object
+                    properties:
+                      role:    { type: string, enum: [user, assistant] }
+                      content: { type: string }
+      responses:
+        '200':
+          description: поток SSE
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '503': { $ref: '#/components/responses/Degraded' }
+
+  /v1/branches:
+    get:
+      tags: [reference]
+      summary: Справочник филиалов
+      operationId: listBranches
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    branch_id:    { type: string }
+                    name:         { type: string }
+                    municipality: { type: string, nullable: true }
+                    address:      { type: object, additionalProperties: true }
+                    windows:      { type: integer }
+                    schedule:     { type: array, items: { type: string } }
+
+  /v1/version:
+    get:
+      tags: [reference]
+      summary: Версии корпуса, моделей и совместимость индекса
+      description: |
+        `embed_fingerprint` из ответа обязан совпасть с тем, что записан в `meta`
+        при построении индекса. Несовпадение означает, что индекс и запросы
+        кодируются разными моделями — молчаливая деградация качества
+        (−19 п.п. R@1 по замерам на этом корпусе). При несовпадении сервис
+        отвечает `503 index_fingerprint_mismatch`, а не «как-нибудь ищет».
+      operationId: getVersion
+      security: []
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api:               { type: string, example: "1.0.0" }
+                  corpus:            { $ref: '#/components/schemas/CorpusVersion' }
+                  embed_fingerprint: { type: string }
+                  gpu_gateway:       { type: string, enum: [up, down, degraded] }
+                  mode:              { type: string, enum: [dense, degraded_lexical] }
+
+  /v1/health:
+    get:
+      tags: [reference]
+      summary: Liveness
+      operationId: health
+      security: []
+      responses:
+        '200': { description: alive }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  parameters:
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: нет или неверный токен
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: не найдено
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Degraded:
+      description: gpu-gateway недоступен — плотный поиск невозможен
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Speaker:
+      type: string
+      nullable: true
+      enum: [client, operator, null]
+      description: |
+        Диаризации нет. ASR всегда отдаёт `null`; роль проставляет LLM при извлечении.
+        Поле оставлено в контракте, чтобы включить диаризацию позже без смены версии API.
+
+    Recipient:
+      type: string
+      nullable: true
+      enum: [person, ip, organization, null]
+
+    Category:
+      type: string
+      enum: [ВБД, СВО, ЧАЭС, многодетный, инвалид, пенсионер, малоимущий, военнослужащий]
+
+    CorpusVersion:
+      type: object
+      properties:
+        cards:    { type: integer, example: 732 }
+        types:    { type: integer, example: 318 }
+        built_at: { type: string, format: date-time }
+        source_sha: { type: string }
+
+    Utterance:
+      type: object
+      required: [seq, text]
+      properties:
+        seq:     { type: integer }
+        t0:      { type: number, description: секунды от начала сессии }
+        t1:      { type: number }
+        text:    { type: string }
+        speaker: { $ref: '#/components/schemas/Speaker' }
+        source:  { type: string, enum: [asr, operator_typed] }
+        asr_ms:  { type: integer }
+
+    Turn:
+      allOf:
+        - $ref: '#/components/schemas/Utterance'
+        - type: object
+          properties:
+            empty:
+              type: boolean
+              description: |
+                Сегмент без содержательных слов («ага», «понятно») — LLM на нём
+                не вызывалась. Единственный фильтр вызовов, который выжил замеры:
+                содержательный гейт терял 37% фактов ради 47% экономии и удалён.
+
+    DialogState:
+      type: object
+      description: |
+        Монотонное состояние: заполненное поле не обнуляется молчанием LLM.
+        Валидация по enum снимает 89% дрейфа значений, монотонность — остаток.
+      properties:
+        life_situation: { type: string, nullable: true }
+        recipient:      { $ref: '#/components/schemas/Recipient' }
+        municipality:   { type: string, nullable: true }
+        facts:
+          type: object
+          properties:
+            age:        { type: integer, nullable: true }
+            children:   { type: integer, nullable: true }
+            categories: { type: array, items: { $ref: '#/components/schemas/Category' } }
+        intents:
+          type: array
+          items: { type: string }
+          description: volatile — переформулируется каждый ход, в стабильное состояние не входит
+        pinned:
+          type: array
+          items: { type: string }
+          description: поля, выставленные оператором вручную; извлечение их не трогает
+        changed:
+          type: object
+          additionalProperties: true
+          description: "что изменилось на последнем ходу: поле → [было, стало]"
+
+    QueryFeatures:
+      type: object
+      description: То, что LLM заполняет вместо того, чтобы сочинять поисковую строку.
+      properties:
+        intents:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items: { type: string, maxLength: 90 }
+          description: первое намерение весит 3:1 при слиянии RRF
+        life_situation: { type: string, nullable: true }
+        recipient:      { $ref: '#/components/schemas/Recipient' }
+        municipality:   { type: string, nullable: true }
+        facts:
+          type: object
+          additionalProperties: true
+        unresolved:
+          type: array
+          items: { type: string }
+
+    Reason:
+      type: object
+      description: Причина статуса права. `quote` дословно присутствует в исходной карточке.
+      properties:
+        why:        { type: string, example: "услуга для категории: СВО" }
+        quote:      { type: string, nullable: true }
+        field:      { type: string, nullable: true }
+        need_fact:  { type: string, nullable: true, description: какого факта не хватило для вердикта }
+        alternatives:
+          type: array
+          items: {}
+          description: предикаты одного поля — альтернативы (ИЛИ), разных — совокупность (И)
+
+    Highlight:
+      type: object
+      description: |
+        Подсветка в тексте карточки. Считается детерминированно поиском дословной
+        цитаты предиката в поле карточки — без вызова LLM.
+      required: [field, start, end, kind]
+      properties:
+        field: { type: string, example: serviceRecipients }
+        start: { type: integer, description: смещение в символах в исходном тексте поля }
+        end:   { type: integer }
+        kind:
+          type: string
+          enum: [blocking, matching, unknown, term, payment]
+          description: |
+            `blocking` — почему не положено; `matching` — условие, которому клиент
+            удовлетворяет; `unknown` — условие есть, факта нет;
+            `term`/`payment` — срок и плата из структурных полей.
+        reason: { type: string }
+
+    SearchResult:
+      type: object
+      properties:
+        rank:      { type: integer }
+        type_id:   { type: integer, format: int64 }
+        service_id:
+          type: string
+          nullable: true
+          description: null, если муниципалитет неизвестен — тогда смотри `available_in`
+        title:     { type: string }
+        score:     { type: number }
+        status:
+          type: string
+          enum: [eligible, blocked, unknown]
+        reasons:   { type: array, items: { $ref: '#/components/schemas/Reason' } }
+        highlights: { type: array, items: { $ref: '#/components/schemas/Highlight' } }
+        needs_municipality: { type: boolean }
+        available_in: { type: array, items: { type: string } }
+        department: { type: string, nullable: true }
+        term_days:  { type: integer, nullable: true }
+        is_free:    { type: boolean, nullable: true }
+
+    Question:
+      type: object
+      description: Наводящий вопрос, выбранный по приросту информации. LLM здесь не участвует.
+      properties:
+        key:       { type: string }
+        question:  { type: string }
+        gain_bits: { type: number, description: сколько бит снимает ответ }
+        splits:    { type: integer }
+
+    SearchResponse:
+      type: object
+      properties:
+        results:       { type: array, items: { $ref: '#/components/schemas/SearchResult' } }
+        questions:     { type: array, items: { $ref: '#/components/schemas/Question' } }
+        missing_facts: { type: array, items: { type: string } }
+        municipality:  { type: string, nullable: true }
+        mode:
+          type: string
+          enum: [dense, degraded_lexical]
+        n_intents:     { type: integer }
+        ms:            { type: number }
+        ms_embed:      { type: number }
+
+    ServiceCard:
+      type: object
+      properties:
+        service_id:   { type: string }
+        type_id:      { type: integer, format: int64 }
+        title:        { type: string }
+        municipality: { type: string, nullable: true }
+        department:   { type: string, nullable: true }
+        fields:
+          type: object
+          description: исходные поля карточки; смещения в Highlight указывают именно на них
+          additionalProperties: { type: string }
+        term_days:    { type: integer, nullable: true }
+        is_free:      { type: boolean, nullable: true }
+        status:       { type: string, enum: [eligible, blocked, unknown], nullable: true }
+        reasons:      { type: array, items: { $ref: '#/components/schemas/Reason' } }
+        highlights:   { type: array, items: { $ref: '#/components/schemas/Highlight' } }
+        branches:
+          type: array
+          items: { type: string }
+          description: где получить; как фильтр поиска бесполезно (медиана 708 услуг на филиал)
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - unauthorized
+                - session_not_found
+                - service_not_found
+                - gpu_unavailable
+                - index_fingerprint_mismatch
+                - schema_validation_failed
+                - audio_format_unsupported
+                - rate_limited
+                - internal
+            message:   { type: string }
+            retryable: { type: boolean }
+            request_id: { type: string }

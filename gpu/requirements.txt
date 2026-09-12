@@ -1,0 +1,26 @@
+# Порядок важен. vllm тянет torch под конкретную CUDA — он ставится ПЕРВЫМ
+# и после этого версию torch не трогает никто (см. onstart.sh, фаза 2).
+vllm>=0.9.0
+
+fastapi>=0.115
+uvicorn[standard]>=0.32
+httpx>=0.27
+websockets>=13
+python-multipart>=0.0.9
+supervisor>=4.2
+
+# ASR: Silero VAD (ONNX) + GigaAM-v3
+silero-vad>=6.0
+onnxruntime>=1.20
+soundfile>=0.12
+soxr>=0.5
+numpy>=2.0
+
+# remote code GigaAM-v3 (modeling_gigaam.py)
+hydra-core>=1.3
+omegaconf>=2.3
+sentencepiece>=0.2
+transformers>=4.45
+
+# эмбеддер
+sentence-transformers>=3.0

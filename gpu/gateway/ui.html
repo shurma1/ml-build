@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gpu-gateway · статус</title>
+<style>
+  :root{
+    --bg:#0B0F11; --panel:#131A1D; --panel-2:#182126; --line:#222E33;
+    --ink:#DCE7E9; --dim:#7E9096; --accent:#4FC3CE;
+    --ok:#5FBF8B; --run:#D9A441; --bad:#E8796F; --idle:#48585E;
+    --mono:'SF Mono',ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:20px 16px 56px}
+
+  header{display:flex;flex-wrap:wrap;gap:14px;align-items:baseline;
+         padding-bottom:16px;border-bottom:1px solid var(--line)}
+  h1{margin:0;font-size:1.15rem;font-weight:600;letter-spacing:-.01em}
+  h1 span{color:var(--dim);font-weight:400}
+  .badge{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;
+         text-transform:uppercase;padding:4px 10px;border-radius:999px;
+         border:1px solid currentColor}
+  .b-ok{color:var(--ok)} .b-run{color:var(--run)} .b-bad{color:var(--bad)} .b-idle{color:var(--idle)}
+  .spacer{flex:1}
+  input[type=password],input[type=number]{
+    background:var(--panel-2);border:1px solid var(--line);color:var(--ink);
+    border-radius:6px;padding:6px 10px;font-family:var(--mono);font-size:.8rem}
+  button{background:var(--panel-2);border:1px solid var(--line);color:var(--ink);
+         border-radius:6px;padding:6px 12px;font-size:.82rem;cursor:pointer}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button[aria-pressed=true]{border-color:var(--accent);color:var(--accent);background:#0F2A2E}
+  button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin:18px 0}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .panel h2{margin:0 0 10px;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;
+            color:var(--dim);font-weight:600;font-family:var(--mono)}
+  dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:.85rem}
+  dt{color:var(--dim)} dd{margin:0;font-family:var(--mono);text-align:right;overflow-wrap:anywhere}
+
+  .bar{height:6px;border-radius:3px;background:var(--panel-2);overflow:hidden;margin-top:8px}
+  .bar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .4s ease}
+  .bar.vram>i{background:linear-gradient(90deg,var(--ok),var(--run))}
+  .bar.indet>i{width:35%;animation:slide 1.4s ease-in-out infinite}
+  @keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
+
+  ol.phases{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px}
+  .ph{display:grid;grid-template-columns:22px 1fr auto;gap:10px;align-items:start;
+      padding:9px 6px;border-radius:6px}
+  .ph:hover{background:var(--panel-2)}
+  .dot{width:9px;height:9px;border-radius:50%;margin:6px auto 0;background:var(--idle)}
+  .dot.done{background:var(--ok)} .dot.failed{background:var(--bad)}
+  .dot.running{background:var(--run);box-shadow:0 0 0 0 var(--run);animation:pulse 1.6s infinite}
+  .dot.skipped{background:var(--idle);opacity:.4}
+  @keyframes pulse{70%{box-shadow:0 0 0 7px rgba(217,164,65,0)}100%{box-shadow:0 0 0 0 rgba(217,164,65,0)}}
+  .ph b{font-weight:500;display:block}
+  .ph small{color:var(--dim);font-family:var(--mono);font-size:.76rem;
+            display:block;word-break:break-word;margin-top:2px}
+  .ph .t{color:var(--dim);font-family:var(--mono);font-size:.76rem;white-space:nowrap;padding-top:2px}
+  .ph.failed small{color:var(--bad)}
+
+  .logs{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .logbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+          padding:10px 14px;border-bottom:1px solid var(--line)}
+  pre{margin:0;padding:14px;height:min(52vh,460px);overflow:auto;
+      font-family:var(--mono);font-size:.76rem;line-height:1.5;color:#B9C9CD;
+      white-space:pre-wrap;word-break:break-word}
+  pre .err{color:var(--bad)} pre .warn{color:var(--run)}
+
+  .note{color:var(--dim);font-size:.82rem;margin:14px 0 0}
+  .err-box{border:1px solid var(--bad);color:var(--bad);border-radius:8px;
+           padding:10px 14px;margin:14px 0;font-size:.86rem}
+  @media (max-width:600px){dl{grid-template-columns:1fr;gap:2px}dd{text-align:left}}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>gpu-gateway <span id="host"></span></h1>
+  <span class="badge b-idle" id="badge">подключение</span>
+  <span class="spacer"></span>
+  <input type="password" id="token" placeholder="Bearer-токен" size="22" autocomplete="off">
+  <button id="save">Сохранить</button>
+</header>
+
+<div id="err" class="err-box" hidden></div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Карта</h2>
+    <dl id="gpu"><dt>ожидание</dt><dd>—</dd></dl>
+    <div class="bar vram"><i id="vrambar"></i></div>
+    <div class="note" id="vramtext">—</div>
+  </div>
+  <div class="panel">
+    <h2>Модели</h2>
+    <dl id="models"><dt>ожидание</dt><dd>—</dd></dl>
+  </div>
+  <div class="panel">
+    <h2>Счётчики</h2>
+    <dl id="metrics"><dt>ожидание</dt><dd>—</dd></dl>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Загрузка</h2>
+  <ol class="phases" id="phases"></ol>
+</div>
+
+<div class="logs" style="margin-top:12px">
+  <div class="logbar">
+    <button id="tab-vllm" aria-pressed="true">vllm</button>
+    <button id="tab-gateway" aria-pressed="false">gateway</button>
+    <span class="spacer"></span>
+    <label class="note" for="tail">строк</label>
+    <input type="number" id="tail" value="200" min="20" max="2000" step="20" style="width:88px">
+    <button id="follow" aria-pressed="true">Следить</button>
+  </div>
+  <pre id="log">подключение…</pre>
+</div>
+
+<p class="note">Страница опрашивает <code>/v1/status</code> раз в 1.5 с и <code>/v1/logs</code> раз в 2 с.
+Токен хранится только в этом браузере и уходит в заголовке Authorization.</p>
+
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const KEY = "mfc_gw_token";
+
+  // Токен: из ?token=, иначе из localStorage. Приходит в заголовке, не в URL.
+  const qs = new URLSearchParams(location.search);
+  let token = qs.get("token") || localStorage.getItem(KEY) || "";
+  $("token").value = token;
+  if (qs.get("token")) { try { localStorage.setItem(KEY, token); } catch (e) {}
+    history.replaceState(null, "", location.pathname); }
+  $("save").onclick = () => {
+    token = $("token").value.trim();
+    try { localStorage.setItem(KEY, token); } catch (e) {}
+    setErr(""); tick(); pullLog();
+  };
+  $("host").textContent = location.host;
+
+  const hdr = () => token ? { Authorization: "Bearer " + token } : {};
+  const setErr = m => { const e = $("err"); e.hidden = !m; e.textContent = m; };
+
+  function badge(cls, text) {
+    const b = $("badge");
+    b.className = "badge " + cls;
+    b.textContent = text;
+  }
+
+  const fmtGB = b => (b / 1073741824).toFixed(1) + " ГБ";
+  const fmtSec = s => s == null ? "" : (s < 90 ? s + " с" : Math.round(s / 60) + " мин");
+
+  function dl(el, pairs) {
+    el.innerHTML = pairs.map(([k, v]) =>
+      `<dt>${k}</dt><dd>${v == null || v === "" ? "—" : String(v)}</dd>`).join("");
+  }
+
+  const PH_STATE = { done: "готово", running: "идёт", failed: "ошибка",
+                     pending: "ждёт", skipped: "пропущено" };
+
+  function renderPhases(phases) {
+    $("phases").innerHTML = phases.map(p => {
+      const pct = p.progress < 0 ? null : Math.round(p.progress * 100);
+      const indet = p.state === "running" && p.progress < 0;
+      const showBar = p.state === "running" || (p.state === "done" && p.total_bytes);
+      const bar = showBar
+        ? `<div class="bar${indet ? " indet" : ""}"><i style="width:${indet ? 35 : (pct || 0)}%"></i></div>`
+        : "";
+      const right = p.state === "running" && pct != null ? pct + "%"
+                  : p.elapsed_s != null ? fmtSec(p.elapsed_s)
+                  : PH_STATE[p.state] || "";
+      return `<li class="ph ${p.state}">
+        <span class="dot ${p.state}"></span>
+        <span><b>${p.title}</b>${p.detail ? `<small>${esc(p.detail)}</small>` : ""}${bar}</span>
+        <span class="t">${right}</span></li>`;
+    }).join("");
+  }
+
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  async function tick() {
+    if (!token) { badge("b-bad", "нужен токен"); return; }
+    let d;
+    try {
+      const r = await fetch("/v1/status", { headers: hdr() });
+      if (r.status === 401) { badge("b-bad", "токен не принят"); return; }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      d = await r.json();
+      setErr("");
+    } catch (e) {
+      badge("b-bad", "нет связи");
+      setErr("Шлюз не отвечает: " + e.message + ". Процесс мог перезапускаться — это нормально во время загрузки.");
+      return;
+    }
+
+    if (d.error) badge("b-bad", "ошибка");
+    else if (d.ready) badge("b-ok", "готов");
+    else badge("b-run", "загрузка");
+    setErr(d.error || "");
+
+    const g = d.gpu || {};
+    dl($("gpu"), [
+      ["Устройство", g.name], ["Compute capability", g.compute_capability],
+      ["torch", g.torch], ["CUDA", g.cuda], ["Аптайм", fmtSec(d.uptime_s)],
+    ]);
+    if (g.vram_total_mb) {
+      const pct = 100 * g.vram_used_mb / g.vram_total_mb;
+      $("vrambar").style.width = pct + "%";
+      $("vramtext").textContent =
+        `${(g.vram_used_mb / 1024).toFixed(1)} из ${(g.vram_total_mb / 1024).toFixed(1)} ГБ · свободно ${((g.vram_total_mb - g.vram_used_mb) / 1024).toFixed(1)} ГБ`;
+    }
+
+    const m = d.models || {};
+    dl($("models"), [
+      ["LLM", m.llm && m.llm.model], ["Схема", m.llm && m.llm.struct_mode],
+      ["ASR", m.asr && (m.asr.repo + " / " + m.asr.variant)],
+      ["Эмбеддер", m.embed && m.embed.model],
+      ["Отпечаток", m.embed && m.embed.fingerprint],
+      ["Промпт", m.prompt_version],
+      ["Процесс vLLM", d.vllm_alive ? "жив" : "не запущен"],
+    ]);
+
+    const k = d.metrics || {};
+    const cache = (m.embed && m.embed.cache) || {};
+    dl($("metrics"), [
+      ["Реплик распознано", k.asr_segments], ["Отброшено устаревших", k.asr_dropped],
+      ["Строк векторизовано", k.embed_texts], ["Кэш эмбеддера", `${cache.hits || 0} / ${cache.misses || 0}`],
+      ["Извлечений фактов", k.llm_extract], ["Вопросов по документу", k.llm_ask],
+      ["Значений вне схемы", k.llm_dropped_keys], ["Ошибок", k.errors],
+    ]);
+
+    renderPhases(d.phases || []);
+  }
+
+  // --- логи ---
+  let logName = "vllm", follow = true;
+  const setTab = n => {
+    logName = n;
+    $("tab-vllm").setAttribute("aria-pressed", String(n === "vllm"));
+    $("tab-gateway").setAttribute("aria-pressed", String(n === "gateway"));
+    pullLog();
+  };
+  $("tab-vllm").onclick = () => setTab("vllm");
+  $("tab-gateway").onclick = () => setTab("gateway");
+  $("follow").onclick = () => {
+    follow = !follow;
+    $("follow").setAttribute("aria-pressed", String(follow));
+  };
+
+  async function pullLog() {
+    if (!token) return;
+    try {
+      const tail = Math.max(20, Math.min(2000, +$("tail").value || 200));
+      const r = await fetch(`/v1/logs?name=${logName}&tail=${tail}`, { headers: hdr() });
+      if (!r.ok) return;
+      const d = await r.json();
+      const pre = $("log");
+      pre.innerHTML = (d.lines.length ? d.lines : ["— пусто —"]).map(l => {
+        const cls = /error|traceback|failed|oom|cuda error/i.test(l) ? "err"
+                  : /warn/i.test(l) ? "warn" : "";
+        return cls ? `<span class="${cls}">${esc(l)}</span>` : esc(l);
+      }).join("\n");
+      if (follow) pre.scrollTop = pre.scrollHeight;
+    } catch (e) { /* шлюз перезапускается — следующий тик подхватит */ }
+  }
+
+  tick(); pullLog();
+  setInterval(tick, 1500);
+  setInterval(pullLog, 2000);
+})();
+</script>
+</body>
+</html>

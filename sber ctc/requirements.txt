@@ -1,0 +1,16 @@
+# core
+numpy>=2.0
+torch>=2.5
+torchaudio>=2.5
+soundfile>=0.12
+sounddevice>=0.5
+silero-vad>=6.0
+transformers>=4.45
+
+# GigaAM-v3 remote code (modeling_gigaam.py) dependencies
+hydra-core>=1.3
+omegaconf>=2.3
+sentencepiece>=0.2
+
+# optional: Silero VAD ONNX backend (falls back to torch.jit if absent)
+onnxruntime>=1.20

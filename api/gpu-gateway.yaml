@@ -1,0 +1,435 @@
+openapi: 3.1.0
+info:
+  title: МФЦ Поиск — gpu-gateway (внутренний)
+  version: 1.0.0
+  description: |
+    Единая точка входа к трём моделям на арендованной GPU-машине (vast.ai, RTX 5090 32 ГБ):
+    ASR (GigaAM-v3 + Silero VAD), эмбеддер (mE5-large-instruct), LLM (Qwen3.5 FP8 через vLLM).
+
+    **Сервис не хранит состояния и не знает бизнес-логики.** Ни сессий, ни диалогов,
+    ни корпуса услуг. Всё, что переживает рестарт, живёт в core-api. Инстанс vast.ai
+    может быть вытеснен в любой момент — потеря этого сервиса обязана быть
+    деградацией, а не порчей данных.
+
+    Наружу открыт один порт. Доступ только от core-api: Bearer-токен поверх
+    cloudflared-туннеля (у vast.ai адрес и порт меняются при каждом перезапуске
+    инстанса — туннель даёт стабильное имя и TLS без входящих портов).
+servers:
+  - url: https://gpu.mfc.example.ru
+    description: туннель к инстансу vast.ai
+security:
+  - bearerAuth: []
+tags:
+  - name: asr
+  - name: embed
+  - name: llm
+  - name: ops
+
+paths:
+  /v1/asr/stream:
+    get:
+      tags: [asr]
+      summary: "WebSocket: аудио вверх, распознанные реплики вниз (описание протокола)"
+      description: |
+        **Вверх (binary):** PCM `s16le`, 16 кГц, моно, кадры 20–40 мс.
+        Ресемплинг и VAD — на сервере (Silero VAD, ONNX): preroll 120 мс,
+        конец реплики по 200 мс тишины, принудительный сброс на 12 с.
+
+        **Частичных гипотез нет и не будет.** GigaAM декодирует завершённый сегмент
+        целиком, а не по кадрам. Единица выдачи — реплика, закрытая VAD.
+
+        **Вниз (text, JSON):**
+        ```json
+        {"type":"utterance","seq":12,"t0":3.21,"t1":6.04,"text":"…","speaker":null,"ms":118}
+        {"type":"dropped","seq":13,"reason":"stale"}
+        {"type":"error","code":"audio_format_unsupported"}
+        ```
+        `speaker` всегда `null`: диаризации нет, роль восстанавливает LLM.
+        Поле присутствует в контракте, чтобы включить диаризацию без смены версии API.
+      parameters:
+        - { name: session_id, in: query, required: true, schema: { type: string } }
+        - { name: sample_rate, in: query, schema: { type: integer, default: 16000 } }
+        - { name: format, in: query, schema: { type: string, enum: [pcm_s16le], default: pcm_s16le } }
+      responses:
+        '101': { description: Switching Protocols }
+
+  /v1/asr/transcribe:
+    post:
+      tags: [asr]
+      summary: Расшифровка файла целиком
+      description: Для регрессионных прогонов и отладки. Тот же VAD, та же модель, тот же формат сегментов.
+      operationId: transcribeFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio]
+              properties:
+                audio: { type: string, format: binary, description: wav любой частоты дискретизации }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      segments:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            seq:  { type: integer }
+                            t0:   { type: number }
+                            t1:   { type: number }
+                            text: { type: string }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+  /v1/embed:
+    post:
+      tags: [embed]
+      summary: Векторизация текста
+      description: |
+        **Префикс применяется здесь, а не вызывающей стороной.** `kind=query` добавляет
+        `Instruct: …\nQuery: `, `kind=passage` — свой префикс или пустой, по модели.
+        Если оставить это вызывающему коду, индекс и запрос однажды разъедутся молча:
+        на этом корпусе потеря префикса стоит 19 п.п. R@1.
+
+        Батч почти бесплатен: пять строк одного диалогового хода стоят ×1.23 от одной,
+        а не ×5 — поэтому все намерения одного хода отправляются одним запросом.
+      operationId: embed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [texts, kind]
+              properties:
+                texts:
+                  type: array
+                  minItems: 1
+                  maxItems: 256
+                  items: { type: string, maxLength: 4000 }
+                kind: { type: string, enum: [query, passage] }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      vectors:
+                        type: array
+                        items: { type: array, items: { type: number } }
+                      dim: { type: integer, example: 1024 }
+                      fingerprint:
+                        type: string
+                        description: |
+                          Отпечаток конфигурации кодирования: модель + max_seq + нормализация
+                          + хэш префиксов. Пишется в `meta` при построении индекса и
+                          сверяется core-api при старте. Несовпадение — отказ, не догадки.
+                        example: "e5-large-instruct/512/norm/9f1c2a"
+                  meta: { $ref: '#/components/schemas/Meta' }
+        '503': { $ref: '#/components/responses/NotReady' }
+
+  /v1/llm/extract:
+    post:
+      tags: [llm]
+      summary: Извлечь факты о посетителе из окна диалога
+      description: |
+        Возвращает **уже провалидированный** по enum JSON. Слияние в состояние диалога
+        происходит в core-api: этот сервис стейтлесс.
+
+        Генерация идёт под `guided_json` — значение вне enum физически не может быть
+        сгенерировано; `validate()` остаётся страховкой на приёме (движок может
+        отвалиться по таймауту, ответ может прийти из кэша старой схемы).
+
+        **Порядок промпта фиксирован: схема → инструкция → реплики в хронологии,
+        только дописывание.** Это одновременно:
+          * даёт попадание в prefix cache vLLM — префилл падает с ~1200 токенов
+            на ход до ~30, то есть в 40 раз;
+          * снимает нестабильность от перестановки фактов (у 9B измерено 14%
+            смены вердикта при перестановке — переставлять больше нечего).
+        Нарушение порядка ломает и то и другое сразу.
+      operationId: extractFacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, turns]
+              properties:
+                session_id:
+                  type: string
+                  description: только для маршрутизации кэша и лимитера; сервис ничего не запоминает
+                turns:
+                  type: array
+                  items:
+                    type: object
+                    required: [seq, text]
+                    properties:
+                      seq:     { type: integer }
+                      text:    { type: string }
+                      speaker: { type: string, nullable: true, enum: [client, operator, null] }
+                schema_version: { type: string, default: "v1" }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      facts:
+                        type: object
+                        description: результат validate(); ключи вне схемы отброшены молча
+                      raw_dropped:
+                        type: array
+                        items: { type: string }
+                        description: поля, отброшенные валидацией — сигнал дрейфа схемы, пишется в метрику
+                  meta: { $ref: '#/components/schemas/Meta' }
+        '409':
+          description: сегмент устарел — диалог ушёл вперёд, пока запрос стоял в очереди
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/NotReady' }
+
+  /v1/llm/ask:
+    post:
+      tags: [llm]
+      summary: Ответ на вопрос оператора по одному документу (SSE)
+      description: |
+        Документ приходит в запросе, а не подтягивается сервисом: корпус живёт
+        на основном сервере. Повторные вопросы по той же карточке попадают
+        в prefix cache — второй вопрос дешевле первого примерно вдесятеро.
+
+        Заземление жёсткое: отвечать только содержимым `document`, каждое
+        утверждение подкреплять дословной цитатой, чего нет — «в регламенте не указано».
+      operationId: askDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [document, question]
+              properties:
+                document:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: поля карточки услуги
+                question: { type: string, maxLength: 1000 }
+                history:
+                  type: array
+                  maxItems: 20
+                  items:
+                    type: object
+                    properties:
+                      role:    { type: string, enum: [user, assistant] }
+                      content: { type: string }
+                stream: { type: boolean, default: true }
+      responses:
+        '200':
+          description: "SSE: delta / citation / done"
+          content:
+            text/event-stream: { schema: { type: string } }
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      answer: { type: string }
+                      citations:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            quote: { type: string }
+                            field: { type: string }
+                            start: { type: integer }
+                            end:   { type: integer }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+  /v1/llm/explain:
+    post:
+      tags: [llm]
+      summary: Проговорить готовый вердикт о праве человеческим языком
+      description: |
+        **Вердикт приходит на вход, LLM его не выносит.** Рантайм-проверка права
+        силами LLM измерена и отвергнута: 14% самопротиворечий, 17% ложных отказов,
+        2.7 с на услугу. Здесь модель только переводит «услуга для категории: СВО»
+        + цитату регламента в фразу, которую оператор произнесёт вслух.
+
+        Цитаты в ответе не переписываются — сверяются на дословное вхождение,
+        изменённая цитата отбрасывается.
+      operationId: explainVerdict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, status, reasons]
+              properties:
+                title:  { type: string }
+                status: { type: string, enum: [eligible, blocked, unknown] }
+                reasons:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      why:   { type: string }
+                      quote: { type: string, nullable: true }
+                facts: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      text:      { type: string, description: 1–2 предложения для оператора }
+                      alternatives_hint: { type: string, nullable: true }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+  /v1/chat/completions:
+    post:
+      tags: [llm]
+      summary: Сырой OpenAI-совместимый проброс в vLLM
+      description: |
+        Оставлен для отладки, оффлайн-генераторов (`eval/generate_*.py`) и будущих задач.
+        **Продуктовый код ходит в задачные эндпойнты выше**, чтобы промпт и схема
+        версионировались на сервере, а не расползались по вызывающим.
+      operationId: chatCompletions
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: как у OpenAI
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness — процесс жив
+      security: []
+      operationId: healthz
+      responses:
+        '200': { description: alive }
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness — все три модели загружены и прогреты
+      description: |
+        Красный, пока не прогрет каждый из трёх воркеров. Прогрев обязателен:
+        первый вызов GigaAM и первая компиляция CUDA-графов vLLM стоят десятки секунд,
+        и без прогрева они достанутся первому живому посетителю.
+      security: []
+      operationId: readyz
+      responses:
+        '200':
+          description: готов
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asr:   { type: boolean }
+                  embed: { type: boolean }
+                  llm:   { type: boolean }
+                  vram_used_mb:  { type: integer }
+                  vram_total_mb: { type: integer }
+        '503': { description: ещё грузится или упал воркер }
+
+  /v1/models:
+    get:
+      tags: [ops]
+      summary: Что именно загружено
+      description: Источник правды для сверки отпечатков и для записи версий в лог поиска.
+      operationId: listModels
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asr:   { type: object, properties: { repo: {type: string}, variant: {type: string} } }
+                  embed: { type: object, properties: { model: {type: string}, dim: {type: integer}, fingerprint: {type: string} } }
+                  llm:   { type: object, properties: { model: {type: string}, quantization: {type: string}, max_model_len: {type: integer} } }
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus
+      security: []
+      operationId: metrics
+      responses:
+        '200': { description: text/plain }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  responses:
+    NotReady:
+      description: модель ещё не прогрета или воркер упал
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Meta:
+      type: object
+      description: Единый конверт — чтобы таймауты, ретраи и трассировка писались один раз.
+      properties:
+        ms:         { type: number }
+        model:      { type: string }
+        request_id: { type: string }
+        queued_ms:  { type: number, description: сколько простоял в очереди лимитера }
+        cached_prefix_tokens: { type: integer, description: попадание в prefix cache vLLM }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [unauthorized, not_ready, stale_segment, rate_limited,
+                     audio_format_unsupported, schema_validation_failed, oom, internal]
+            message:    { type: string }
+            retryable:  { type: boolean }
+            request_id: { type: string }
