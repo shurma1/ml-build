@@ -19,7 +19,7 @@ from ..errors import ApiError, error_body
 from ..events import hub, DEGRADED, ERROR, READY, degraded_payload
 from ..gateway import gateway
 from ..search_service import search_service
-from ..sessions import manager
+from ..sessions import STATE_FIELDS, manager
 
 log = logging.getLogger("core.routers.sessions")
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
@@ -31,7 +31,14 @@ async def create_session(body: dict, request: Request):
     operator_id = (body or {}).get("operator_id")
     if not branch_id or not operator_id:
         raise ApiError("schema_validation_failed", "нужны branch_id и operator_id")
-    s = await manager.create(branch_id, operator_id, (body or {}).get("window"))
+    vad = (body or {}).get("vad_silence_ms")
+    if vad is not None:
+        lo, hi = C.ASR_SILENCE_LIMITS
+        if not isinstance(vad, (int, float)) or isinstance(vad, bool) or not lo <= vad <= hi:
+            raise ApiError("schema_validation_failed",
+                           f"vad_silence_ms: целое от {lo} до {hi}")
+        vad = int(vad)
+    s = await manager.create(branch_id, operator_id, (body or {}).get("window"), vad)
     return {"session_id": s.id, "ws_url": _ws_url(request, s.id),
             "municipality": s.municipality,
             "corpus_version": await _corpus_version()}
@@ -75,6 +82,12 @@ async def answer_questions(session_id: str, body: dict):
     for a in answers:
         if not isinstance(a, dict) or "key" not in a or "value" not in a:
             raise ApiError("schema_validation_failed", "каждый ответ — {key, value}")
+        # `fact` необязателен и приходит из того же вопроса, что показали оператору.
+        # Проверяем по белому списку полей состояния: клиент не должен уметь
+        # записать ответом произвольный ключ.
+        fact = a.get("fact")
+        if fact is not None and fact not in STATE_FIELDS:
+            raise ApiError("schema_validation_failed", f"fact: неизвестное поле {fact}")
     s = await manager.get(session_id)
     r = await manager.answer(s, answers)
     return r or {"results": [], "questions": [], "mode": search_service.mode}
@@ -86,9 +99,11 @@ async def set_facts(session_id: str, body: dict):
     unpin = (body or {}).get("unpin") or []
     if not isinstance(setter, dict) or not isinstance(unpin, list):
         raise ApiError("schema_validation_failed", "set — объект, unpin — список полей")
+    dismiss = _fact_refs((body or {}).get("dismiss"), "dismiss")
+    restore = _fact_refs((body or {}).get("restore"), "restore")
     clean = _validate_facts(setter)
     s = await manager.get(session_id)
-    return await manager.set_facts(s, clean, unpin)
+    return await manager.set_facts(s, clean, unpin, dismiss, restore)
 
 
 @router.post("/{session_id}/close", status_code=204)
@@ -244,6 +259,11 @@ async def _open_asr(s):
         return None
     url = gateway.base_url.replace("https://", "wss://").replace("http://", "ws://")
     url = f"{url}/v1/asr/stream?session_id={s.id}&sample_rate=16000&format=pcm_s16le"
+    # Пауза VAD — на соединение, а не на весь шлюз: приёмы идут одновременно, и
+    # общая настройка означала бы, что подкрутка под одного посетителя достаётся
+    # всем окнам сразу.
+    if s.vad_silence_ms:
+        url += f"&silence_ms={s.vad_silence_ms}"
     if gateway.token:
         url += f"&token={gateway.token}"
     try:
@@ -268,6 +288,9 @@ async def _open_asr(s):
                     except Exception as e:                      # noqa: BLE001
                         log.error("сессия %s: ход не обработан: %s", s.id, e)
                         hub.emit(s.id, ERROR, error_body("internal", str(e)))
+                elif ev.get("type") == "ready":
+                    # Шлюз сообщает, какие параметры VAD он в итоге применил.
+                    log.info("сессия %s: ASR подключён, VAD=%s", s.id, ev.get("vad"))
                 elif ev.get("type") == "error":
                     hub.emit(s.id, ERROR, error_body(
                         ev.get("code") or "internal", ev.get("message") or "ошибка ASR"))
@@ -286,6 +309,28 @@ def _cmd(text):
         return (json.loads(text) or {}).get("type")
     except Exception:                                           # noqa: BLE001
         return None
+
+
+def _fact_refs(raw, name):
+    """`[{key, value}]` — снять факт с работы или вернуть его обратно.
+
+    Значение обязательно, и это не формальность: снимается конкретное значение,
+    а не поле целиком. Иначе одно нажатие по «город Тула» глушило бы
+    муниципалитет до конца приёма, и поправку клиента услышать было бы нечем.
+    """
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list):
+        raise ApiError("schema_validation_failed", f"{name} — список объектов {{key, value}}")
+    out = []
+    for x in raw:
+        key = x.get("key") if isinstance(x, dict) else None
+        value = x.get("value") if isinstance(x, dict) else None
+        if key not in STATE_FIELDS or value in (None, "", [], {}):
+            raise ApiError("schema_validation_failed",
+                           f"{name}: {{key, value}}, key из " + ", ".join(STATE_FIELDS))
+        out.append({"key": key, "value": str(value)})
+    return out
 
 
 def _validate_facts(setter):

@@ -268,7 +268,19 @@ async def asr_stream(ws: WebSocket):
                             "message": f"нужен {C.SAMPLE_RATE} Гц, пришло {sr}"})
         await ws.close(); return
 
-    stream = asr.stream()
+    # Параметры VAD на ЭТО соединение. Без них берутся общие (POST /v1/asr/vad).
+    # Смысл держать их здесь: приём с торопливым посетителем и приём, где долго
+    # think вслух, требуют разной паузы, а общая настройка одна на всех.
+    vad_over, bad = _vad_overrides(ws.query_params)
+    if bad:
+        await ws.send_json({"type": "error", "code": "schema_validation_failed",
+                            "message": bad})
+        await ws.close(); return
+
+    stream = asr.stream(**vad_over)
+    await ws.send_json({"type": "ready", "vad": {
+        "threshold": stream.threshold, "silence_ms": stream.silence_ms,
+        "pad_ms": stream.pad_ms}})
     loop = asyncio.get_running_loop()
     seq = 0
     pending = 0
@@ -347,6 +359,89 @@ async def asr_file(audio: UploadFile = File(...)):
             segs.append({"seq": seq, "t0": a, "t1": b, "text": text, "ms": ms})
     stream.close()
     return ok({"segments": segs}, t0, model=C.ASR_REPO)
+
+
+# --- VAD: настройка задержки без рестарта ----------------------------------------
+#
+# VadStream строится на каждое соединение к /v1/asr/stream и берёт параметры из
+# конфигурации в момент построения. Поэтому правка модульных переменных здесь
+# действует на новые соединения (новый приём) без рестарта и без пересборки
+# образа: висящие реплики сохраняют свой старый автомат, это верное поведение.
+
+VAD_LIMITS = {"threshold": (0.05, 0.95), "silence_ms": (80, 1000), "pad_ms": (0, 500)}
+
+# Из трёх настроек времени стоит только silence_ms: это пауза, которую автомат
+# ВЫЖИДАЕТ, прежде чем отдать уже сказанную реплику. Замерено на 37 с живого
+# русского диалога настоящим автоматом:
+#
+#   silence_ms   реплик   речи, с   медиана реплики
+#         400         7      31.4        3.64 с
+#         200        10      30.1        2.45 с     <- по умолчанию
+#         100        12      29.2        2.38 с
+#          80        13      28.9        2.24 с
+#
+# Снижение до 100 мс экономит 100 мс на реплике, но дробит: 2 реплики из 10
+# распадаются надвое, появляется обрывок в 0.32 с. Каждая лишняя реплика — это
+# лишний вызов извлечения фактов, а он на боевой карте занимал 5.2 с (медиана
+# по 18 настоящим вызовам в логе). То есть выигрыш 0.1 с покупается ростом
+# числа вызовов на 20%.
+#
+# Обрезка хвоста при этом безопасна: в последних 200 мс каждой из 10 реплик
+# энергия ~0.001 против 0.12 в ядре, то есть там тишина, а не конец слова.
+#
+# pad_ms оставлен ради контракта, но в этой реализации не влияет ни на что:
+# silero сдвигает им только метки, а VadStream ведёт своё время по блокам.
+
+
+def _vad_overrides(params):
+    """Параметры VAD из query-строки соединения. -> (переопределения, ошибка)."""
+    out = {}
+    for key, (lo, hi) in VAD_LIMITS.items():
+        raw = params.get(key)
+        if raw is None:
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return {}, f"{key} — не число"
+        if not lo <= v <= hi:
+            return {}, f"{key}: от {lo} до {hi}"
+        out[key] = int(v) if key.endswith("_ms") else v
+    return out, None
+
+
+def _vad_now():
+    return {"threshold": C.VAD_THRESHOLD, "silence_ms": C.VAD_SILENCE_MS,
+            "pad_ms": C.VAD_PAD_MS}
+
+
+@app.get("/v1/asr/vad")
+async def vad_get():
+    return ok(_vad_now(), time.perf_counter())
+
+
+@app.post("/v1/asr/vad")
+async def vad_set(body: dict):
+    t0 = time.perf_counter()
+    body = body or {}
+    clean = {}
+    for key, (lo, hi) in VAD_LIMITS.items():
+        if body.get(key) is None:
+            continue
+        try:
+            v = float(body[key])
+        except (TypeError, ValueError):
+            return fail("schema_validation_failed", f"{key} — не число", 400, False)
+        if not lo <= v <= hi:
+            return fail("schema_validation_failed", f"{key}: от {lo} до {hi}", 400, False)
+        clean[key] = int(v) if key.endswith("_ms") else v
+    if not clean:
+        return fail("schema_validation_failed",
+                    "укажите threshold | silence_ms | pad_ms", 400, False)
+    C.VAD_THRESHOLD = clean.get("threshold", C.VAD_THRESHOLD)
+    C.VAD_SILENCE_MS = clean.get("silence_ms", C.VAD_SILENCE_MS)
+    C.VAD_PAD_MS = clean.get("pad_ms", C.VAD_PAD_MS)
+    return ok(_vad_now(), t0, applies_to="new_connections")
 
 
 # --- эмбеддер ----------------------------------------------------------------

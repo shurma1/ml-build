@@ -170,6 +170,40 @@ def test_закреплённый_факт_переживает_извлечен
     assert r["state"]["facts"]["age"] == 70
 
 
+def test_снятый_факт_не_исчезает_но_в_поиск_не_идёт(c, сессия):
+    """Оператор нажал по чипу: факт остаётся на экране зачёркнутым, из признаков
+    уходит и обратно извлечением не возвращается — до конца приёма."""
+    sid = сессия["session_id"]
+    c.post(f"/v1/sessions/{sid}/turns", json={"text": "я пенсионер, нужна выплата"})
+    r = c.post(f"/v1/sessions/{sid}/facts",
+               json={"set": {"categories": ["пенсионер", "многодетный"]}}).json()
+    assert "пенсионер" in r["state"]["facts"]["categories"]
+
+    r = c.post(f"/v1/sessions/{sid}/facts",
+               json={"dismiss": [{"key": "categories", "value": "пенсионер"}]}).json()
+    assert r["state"]["dismissed"]["categories"] == ["пенсионер"]
+    assert "пенсионер" in r["state"]["facts"]["categories"], "факт стёрли, а не сняли"
+
+    r = c.post(f"/v1/sessions/{sid}/turns", json={"text": "я пенсионер"}).json()
+    assert r["state"]["dismissed"]["categories"] == ["пенсионер"], "снятое вернулось"
+
+    # промах по чипу отменяется
+    r = c.post(f"/v1/sessions/{sid}/facts",
+               json={"restore": [{"key": "categories", "value": "пенсионер"}]}).json()
+    assert not r["state"]["dismissed"].get("categories")
+
+
+def test_снятие_требует_значения_а_не_поля(c, сессия):
+    """Иначе одно нажатие глушило бы поле целиком и поправку клиента
+    («не Тула, а Щёкино») услышать было бы нечем."""
+    sid = сессия["session_id"]
+    r = c.post(f"/v1/sessions/{sid}/facts", json={"dismiss": ["municipality"]})
+    assert r.status_code == 400
+    r = c.post(f"/v1/sessions/{sid}/facts",
+               json={"dismiss": [{"key": "нет_такого_поля", "value": "x"}]})
+    assert r.status_code == 400
+
+
 def test_ответ_на_вопрос_переранжирует_а_не_фильтрует(c, сессия):
     """Жёсткий фильтр измерен и хуже: R@1 0.775 против 0.810."""
     sid = сессия["session_id"]

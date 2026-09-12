@@ -2,8 +2,9 @@
 """ASR-воркер: Silero VAD на соединение + одна общая GigaAM-v3 на GPU.
 
 Взято из sber ctc/realtime_asr.py и переложено на много соединений сразу.
-Что сохранено дословно: конечный автомат VAD (preroll 120 мс, конец по 200 мс
-тишины, принудительный сброс на 12 с) и подача сегмента в модель тензором,
+Что сохранено дословно: конечный автомат VAD (preroll 120 мс, конец по
+VAD_SILENCE_MS тишины — по умолчанию 200 мс, настраивается на соединение, —
+принудительный сброс на 12 с) и подача сегмента в модель тензором,
 без временных файлов и ffmpeg.
 
 Что добавлено: сериализация GPU на одном потоке и отбрасывание сегментов,
@@ -69,12 +70,28 @@ class VadStream:
     история тишины, общая на всех она была бы бессмысленной.
     """
 
-    def __init__(self, vad_model, offset=0.0):
+    def __init__(self, vad_model, offset=0.0, silence_ms=None, pad_ms=None,
+                 threshold=None):
+        """Параметры VAD можно задать НА СОЕДИНЕНИЕ, не трогая общие.
+
+        `silence_ms` — единственная настройка, которая реально стоит времени:
+        столько тишины автомат ждёт, прежде чем закрыть реплику. Это чистое
+        ожидание поверх уже сказанного, и в задержку хода оно входит целиком.
+
+        `pad_ms` на задержку НЕ влияет: silero сдвигает им только метки в
+        возвращаемом словаре, а этот автомат их не читает — он ведёт своё время
+        по блокам (`self.t`), а разгон записывает из очереди `pre` длиной
+        PREROLL. Держим параметр ради совместимости с контрактом, но менять его
+        бессмысленно, пока `_block` не начнёт использовать смещения silero.
+        """
         from silero_vad import VADIterator
-        self.it = VADIterator(vad_model, threshold=C.VAD_THRESHOLD,
+        self.silence_ms = C.VAD_SILENCE_MS if silence_ms is None else int(silence_ms)
+        self.pad_ms = C.VAD_PAD_MS if pad_ms is None else int(pad_ms)
+        self.threshold = C.VAD_THRESHOLD if threshold is None else float(threshold)
+        self.it = VADIterator(vad_model, threshold=self.threshold,
                               sampling_rate=C.SAMPLE_RATE,
-                              min_silence_duration_ms=C.VAD_SILENCE_MS,
-                              speech_pad_ms=C.VAD_PAD_MS)
+                              min_silence_duration_ms=self.silence_ms,
+                              speech_pad_ms=self.pad_ms)
         self.max_seg = int(C.MAX_SEG_SEC * C.SAMPLE_RATE)
         self.pre = deque(maxlen=PREROLL_BLOCKS)
         self.buf: list = []
@@ -224,8 +241,8 @@ class AsrWorker:
         self.load_mode = "from_config + load_state_dict"
         return model
 
-    def stream(self, offset=0.0) -> VadStream:
-        return VadStream(self.vad, offset)
+    def stream(self, offset=0.0, **vad) -> VadStream:
+        return VadStream(self.vad, offset, **vad)
 
     def transcribe(self, wav):
         t0 = time.perf_counter()
@@ -235,7 +252,9 @@ class AsrWorker:
 
     def info(self):
         return {"repo": C.ASR_REPO, "variant": C.ASR_VARIANT,
-                "ready": self.ready, "load_mode": self.load_mode}
+                "ready": self.ready, "load_mode": self.load_mode,
+                "vad": {"threshold": C.VAD_THRESHOLD, "silence_ms": C.VAD_SILENCE_MS,
+                        "pad_ms": C.VAD_PAD_MS}}
 
 
 def pcm16_to_float32(raw: bytes) -> np.ndarray:

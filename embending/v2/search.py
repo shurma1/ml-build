@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""v2 search: dense over service TYPES + lexical rescue + municipality facet.
+"""СТЕНД: dense по типам услуг + лексический дорезолв + фасет МО.
+
+Продуктовый путь — dialog.py, здесь его НЕТ. См. замеры ниже.
 
     from v2.search import Searcher
     s = Searcher()
@@ -21,11 +23,25 @@ _INSTR = ("Given a Russian citizen's question about government services, "
 QUERY_PREFIX = os.getenv("EMB_QUERY_PREFIX",
                          f"Instruct: {_INSTR}\nQuery: " if "instruct" in MODEL else "")
 
-# Dense is the primary channel. The lexical channel and the reranker are RESCUE stages:
-# running them unconditionally costs accuracy and latency (measured on 618 citizen
-# queries: always-on RRF 1:1 drops R@1 0.631 -> 0.586). The gate is the top1-top2
-# MARGIN, not the absolute score — absolute cosine is not comparable across models
-# (e5-instruct sits at 0.88-0.94, bge-m3 at 0.53-0.73), the margin is.
+# ВНИМАНИЕ. Этот модуль — CLI и стенд, а НЕ продуктовый путь: диалоговый поиск
+# идёт через dialog.py -> main backend/core/search_service.py, и ни лексического
+# дорезолва, ни кросс-энкодера там нет. Прежде это выглядело как недоделка; замеры
+# на 690 запросах говорят обратное — обе ступени качества не добавляют:
+#
+#   гибрид dense+tsvector, RRF 1:1 всегда      R@1 0.617  (-11.4 п.п.)
+#   гибрид RRF 5:1 всегда                          0.694  ( -3.8)
+#   гибрид RRF 5:1 при отрыве < 0.005              0.726  ( -0.6)
+#   кросс-энкодер bge-reranker-v2-m3, top-10       0.687  ( -4.5)
+#   он же в сумме с dense по z-оценкам             0.730  ( -0.1)
+#   только dense (как в проде)                     0.732
+#
+# Потолок переранжирования при этом огромен — идеальная сортировка top-10 дала бы
+# R@1 0.977, — но этот кросс-энкодер его не берёт: корпус канцелярский, запросы
+# разговорные, домена модель не видела. Ступени оставлены здесь как стенд для
+# следующей попытки, а не как то, что забыли включить в прод.
+#
+# Гейт — top1-top2 МАРЖА, не абсолютная оценка: абсолютный косинус между моделями
+# не сравним (e5-instruct 0.88-0.94, bge-m3 0.53-0.73), маржа сравнима.
 RESCUE_MARGIN = float(os.getenv("EMB_RESCUE_MARGIN", "0.005"))   # ~ the 25th pct of the margin
 RERANK = os.getenv("EMB_RERANK", "")            # e.g. BAAI/bge-reranker-v2-m3; "" = off
 RERANK_TOPK = int(os.getenv("EMB_RERANK_TOPK", "10"))

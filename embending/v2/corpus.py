@@ -7,7 +7,7 @@ are the same municipal service replicated across 26 municipalities; leaving the
 municipality inside the vector makes those 445 cards mutually indistinguishable
 (intra-cluster cosine 0.83-0.88) and turns their ranking into a coin flip.
 """
-import json, re, collections, hashlib
+import json, os, re, collections, hashlib
 
 # --- 26 municipalities of Tula oblast -------------------------------------
 MUNI_FULL = [
@@ -80,9 +80,15 @@ def _short_list(s, limit=6, cap=400):
     return '; '.join(parts[:limit])[:cap]
 
 
-def load_cards(path):
+def load_cards(src):
+    """src — путь к выгрузке ИЛИ уже разобранный список записей.
+
+    Второй вариант нужен вызывающему, которому те же записи потом понадобятся
+    сырыми: читать шестимегабайтный JSON дважды ради этого незачем.
+    """
+    rows = src if isinstance(src, list) else json.load(open(src, encoding='utf-8'))
     out = []
-    for r in json.load(open(path, encoding='utf-8')):
+    for r in rows:
         title, muni = split_municipality(r)
         dept = (r.get('departmentName') or '').strip()
         out.append({
@@ -109,7 +115,23 @@ def load_cards(path):
 
 
 def _type_key(title):
-    return ' '.join(sorted(set(re.findall(r'[а-яёa-z]{4,}', title.lower()))))
+    """Ключ группировки: мешок значимых слов заголовка.
+
+    Порог в четыре буквы отсекает предлоги и союзы, но вместе с ними съедал
+    аббревиатуры, которые как раз и РАЗЛИЧАЮТ услуги: «… (ВБД)» и «… (СВО)»
+    получали один ключ и склеивались в один тип. Цена склейки — не только
+    произвольный суффикс в показанном заголовке (представитель выбирается по
+    длине, а длины равны), но и общий набор предикатов права на два разных
+    правовых основания.
+
+    Поэтому аббревиатуры в верхнем регистре (2-3 буквы) идут в ключ отдельно.
+    Проверено на корпусе: распадаются ровно три группы — те самые ВБД/СВО, —
+    и ни одна другая. На качестве поиска это не сказывается: 318 типов против
+    321, R@1 0.734 против 0.733, ДИ разницы [-0.004, +0.000].
+    """
+    words = set(re.findall(r'[а-яёa-z]{4,}', title.lower()))
+    words |= {a.lower() for a in re.findall(r'\b[А-ЯЁA-Z]{2,3}\b', title)}
+    return ' '.join(sorted(words))
 
 
 def _type_id(key):
@@ -119,10 +141,41 @@ def _type_id(key):
     return int(hashlib.blake2b(key.encode('utf-8'), digest_size=4).hexdigest(), 16)
 
 
-def build_types(cards):
+# Хранимая таблица группировки: {id карточки -> ключ типа}. Порождается
+# v2/tools/remap_type_keys.py и дальше правится РУКАМИ.
+#
+# Зачем данные вместо вывода из заголовка: ключ типа — это одновременно правило
+# группировки и внешний ключ для predicates.jsonl и aliases_generated.jsonl.
+# Пока он выводился на каждой сборке, любая правка правила молча осиротляла обе
+# таблицы (при добавлении аббревиатур — 57 строк из 318, то есть 60 типов разом
+# без проверки права и без синонимов). Теперь правило меняют, перегенерируют
+# таблицу и СМОТРЯТ РАЗНИЦУ, а неверную склейку можно исправить строкой в файле,
+# не трогая регулярку.
+#
+# Карточка, которой в таблице нет (новая выгрузка), группируется по _type_key():
+# отсутствие файла ничего не ломает, просто возвращает прежнее поведение.
+_TYPE_MAP_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              'data', 'type_map.json')
+_TYPE_MAP = None
+
+
+def type_map(path=None):
+    global _TYPE_MAP
+    if _TYPE_MAP is None:
+        p = path or _TYPE_MAP_PATH
+        try:
+            with open(p, encoding='utf-8') as f:
+                _TYPE_MAP = json.load(f).get('map') or {}
+        except (OSError, ValueError):
+            _TYPE_MAP = {}
+    return _TYPE_MAP
+
+
+def build_types(cards, mapping=None):
+    m = type_map() if mapping is None else mapping
     g = collections.defaultdict(list)
     for c in cards:
-        g[_type_key(c['title'])].append(c)
+        g[m.get(c['id']) or _type_key(c['title'])].append(c)
     types = []
     for key, inst in sorted(g.items()):
         tid = _type_id(key)

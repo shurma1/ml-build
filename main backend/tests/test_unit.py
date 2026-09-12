@@ -221,6 +221,121 @@ def test_закреплённое_поле_не_отдаётся_извлече�
     assert st.state["age"] == 41 and st.state["children"] == 2
 
 
+def test_снятый_факт_остаётся_на_экране_но_из_поиска_уходит():
+    """Нажатие по чипу не стирает факт, а снимает его с работы.
+
+    Стереть нельзя: модель назовёт его на следующей же реплике снова, и оператор
+    будет снимать одно и то же по кругу. Поэтому значение остаётся в состоянии —
+    оператор видит зачёркнутым, что уже отверг, — а из признаков поиска уходит.
+    """
+    from core.sessions import (new_dialog_state, render_state, restore_dismissed,
+                               strip_dismissed, without_dismissed)
+    from features import QueryFeatures
+    st = new_dialog_state()
+    st.update({"intents": ["пособие"], "municipality": "город Тула",
+               "categories": ["пенсионер", "многодетный"]})
+    снятое = {"municipality": {"город Тула"}, "categories": {"пенсионер"}}
+
+    снимок = render_state(st, set(), None, снятое)
+    assert снимок["municipality"] == "город Тула", "факт пропал с экрана"
+    assert снимок["dismissed"] == {"municipality": ["город Тула"],
+                                   "categories": ["пенсионер"]}
+
+    f = strip_dismissed(QueryFeatures.from_llm(st.as_features()), снятое)
+    assert f.municipality is None
+    assert f.facts["categories"] == ["многодетный"], "снята вся категория целиком"
+
+    # извлечение назвало снятое снова — в состояние оно не возвращается
+    assert without_dismissed({"municipality": "город Тула", "categories": ["пенсионер"]},
+                             снятое) == {}
+    # и переживает обрыв WS вместе со снимком
+    assert restore_dismissed(снимок) == снятое
+
+
+def test_снимается_значение_а_не_поле():
+    """Клиент, поправивший себя, должен быть услышан: блокируется ровно то
+    значение, от которого отказались, — иначе одно нажатие глушит поле."""
+    from core.sessions import strip_dismissed, without_dismissed
+    from features import QueryFeatures
+    снятое = {"municipality": {"город Тула"}}
+    assert without_dismissed({"municipality": "Щекинский район"}, снятое) \
+        == {"municipality": "Щекинский район"}
+    f = strip_dismissed(QueryFeatures.from_llm({"municipality": "Щекинский район"}), снятое)
+    assert f.municipality == "Щекинский район"
+
+
+# --- наводящие вопросы -------------------------------------------------------
+
+def _тип(tid, title, life=(), recipients=(), municipalities=()):
+    return {"type_id": tid, "title": title, "life": list(life),
+            "recipients": list(recipients), "municipalities": list(municipalities)}
+
+
+def _признаки(**kw):
+    from features import QueryFeatures
+    return QueryFeatures(**kw)
+
+
+def test_не_спрашиваем_про_то_что_уже_прозвучало():
+    """Худший наводящий вопрос — про факт, который посетитель только что назвал:
+    это не уточнение, а сообщение, что его не слушали."""
+    from clarify import suggest
+    cands = [_тип(1, "Пособие многодетным", ["Многодетная семья"], ["person"]),
+             _тип(2, "Выплата ветеранам", ["Меры поддержки СВО"], ["person"]),
+             _тип(3, "Регистрация ИП", ["Открытие своего дела"], ["ip"]),
+             _тип(4, "Справка о составе семьи", [], ["person"])]
+    голые = {q["key"] for q in suggest(cands, top_n=9)}
+    assert голые, "без известных фактов вопросы должны находиться"
+
+    знаем = _признаки(life_situation="Многодетная семья", recipient="person",
+                      municipality="город Тула", facts={"categories": ["многодетный"]})
+    ключи = {q["key"] for q in suggest(cands, feats=знаем, top_n=9)}
+    assert not ключи & {"life", "recipient", "municipality", "льгота", "ребенок"}, ключи
+
+
+def test_вопрос_обязан_резать_список():
+    """Грань, по которой все кандидаты одинаковы, не снимает ничего.
+
+    Прежняя мера брала энтропию НАБОРОВ значений: у каждой услуги свой кортеж
+    ситуаций, все кортежи разные — и вопрос получал 3.4 бита, не отсекая никого.
+    """
+    from clarify import suggest
+    одинаковые = [_тип(i, f"Выдача справки №{i}", ["Утрата документов"], ["person"])
+                  for i in range(1, 9)]
+    assert [q for q in suggest(одинаковые, top_n=9) if q["key"] == "life"] == []
+
+    разные = ([_тип(i, f"Выплата №{i}", ["Детские пособия"], ["person"]) for i in range(1, 5)]
+              + [_тип(i, f"Справка №{i}", ["Выход на пенсию"], ["person"]) for i in range(5, 9)])
+    жизнь = [q for q in suggest(разные, top_n=9) if q["key"] == "life"]
+    assert жизнь and жизнь[0]["gain_bits"] >= 0.8
+
+
+def test_нехватка_факта_для_вердикта_спрашивается_первой():
+    """Самый честный вопрос — не про список вообще, а про услугу наверху выдачи,
+    вердикт по которой без этого факта не считается."""
+    from clarify import suggest
+    cands = [_тип(1, "Выплата многодетным", ["Детские пособия"], ["person"]),
+             _тип(2, "Выдача паспорта", ["Утрата документов"], ["person"])]
+    q = suggest(cands, needed=["age"], top_n=2)
+    assert q[0]["key"] == "age" and q[0]["gain_bits"] is None
+    assert "лет" in q[0]["question"]
+    # и не дублируется гранью про то же самое
+    q = suggest(cands, needed=["categories"], top_n=9)
+    assert sum(1 for x in q if x["key"] == "льгота") == 1
+
+
+def test_вопросов_может_не_быть_вовсе():
+    """Вопрос ради вопроса стоит посетителю времени, а оператору — доверия."""
+    from clarify import suggest
+    один = [_тип(1, "Выдача справки", ["Утрата документов"], ["person"])]
+    assert suggest(один) == []
+    одинаковые = [_тип(i, f"Выдача справки №{i}", ["Утрата документов"], ["person"])
+                  for i in range(1, 9)]
+    знаем = _признаки(life_situation="Утрата документов", recipient="person",
+                      municipality="город Тула", facts={"children": 0, "categories": ["СВО"]})
+    assert suggest(одинаковые, feats=знаем) == []
+
+
 # --- то, что уходит в extract ------------------------------------------------
 
 def _сессия():

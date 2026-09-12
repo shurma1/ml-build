@@ -49,6 +49,26 @@ paths:
                 branch_id:  { type: string, example: "br-028" }
                 operator_id: { type: string, example: "op-1174" }
                 window:     { type: integer, description: номер окна, nullable: true }
+                vad_silence_ms:
+                  type: integer
+                  minimum: 80
+                  maximum: 1000
+                  nullable: true
+                  description: |
+                    Пауза, которую VAD выжидает, прежде чем закрыть реплику, —
+                    для ЭТОГО приёма. Не задан — берётся настройка шлюза (200 мс).
+
+                    Это единственный параметр VAD, который стоит времени: чистое
+                    ожидание поверх уже сказанного, целиком входящее в задержку
+                    хода. Замерено на 37 с живого русского диалога настоящим
+                    автоматом: 200 мс дают 10 реплик, 100 мс — 12 при той же речи,
+                    причём две реплики распадаются надвое и появляется обрывок
+                    в 0.32 с. Сэкономленные 100 мс покупаются ростом числа реплик
+                    на 20%, а каждая реплика — это вызов извлечения фактов
+                    (5.2 с медиана по 18 настоящим вызовам). Понижать имеет смысл
+                    ради отзывчивости СУБТИТРОВ, а не ради скорости выдачи.
+                    Обрезка хвоста безопасна: в последних 200 мс реплик энергия
+                    ~0.001 против 0.12 в ядре — там тишина, а не конец слова.
       responses:
         '201':
           description: сессия создана
@@ -175,7 +195,17 @@ paths:
                     required: [key, value]
                     properties:
                       key:   { type: string, example: "выплата" }
-                      value: { oneOf: [{type: boolean}, {type: string}] }
+                      value: { oneOf: [{type: boolean}, {type: string}, {type: integer}], nullable: true }
+                      fact:
+                        type: string
+                        nullable: true
+                        description: |
+                          Поле состояния, которое заполняет ответ. Берётся из того же
+                          вопроса, что показали оператору; сервер проверяет его по
+                          белому списку полей состояния. Ответ с `fact` попадает в
+                          состояние ЗАКРЕПЛЁННЫМ: посетитель ответил прямо, и
+                          следующая реплика, разобранная моделью, затирать это не
+                          должна. Без `fact` ответ только переранжирует выдачу.
       responses:
         '200':
           description: список пересчитан
@@ -196,6 +226,13 @@ paths:
 
         Выставленное здесь поле **закрепляется** (`pinned`) и больше не
         перезаписывается извлечением из речи до явного снятия через `unpin`.
+
+        `dismiss` — второй путь правки, для одного нажатия по чипу факта: факт
+        снимается с работы, но не стирается. Он остаётся в `state` и в списке
+        `dismissed`, оператор видит его зачёркнутым, а в поиск и в проверку
+        права он до конца сессии не идёт. Снимается **значение**, а не поле:
+        поправку клиента («не Тула, а Щёкино») слышно как обычно. `restore`
+        возвращает снятое обратно — промах по чипу не должен стоить приёма.
       operationId: setFacts
       requestBody:
         required: true
@@ -218,6 +255,14 @@ paths:
                   type: array
                   items: { type: string }
                   description: снять ручное закрепление с этих полей
+                dismiss:
+                  type: array
+                  description: снять факты с работы до конца сессии
+                  items: { $ref: '#/components/schemas/FactRef' }
+                restore:
+                  type: array
+                  description: вернуть снятые факты в работу
+                  items: { $ref: '#/components/schemas/FactRef' }
       responses:
         '200':
           description: состояние обновлено, право пересчитано
@@ -375,7 +420,8 @@ paths:
         `embed_fingerprint` из ответа обязан совпасть с тем, что записан в `meta`
         при построении индекса. Несовпадение означает, что индекс и запросы
         кодируются разными моделями — молчаливая деградация качества
-        (−19 п.п. R@1 по замерам на этом корпусе). При несовпадении сервис
+        (−0.7…−1.0 п.п. R@1 по замерам на нынешней конфигурации; прежние −19 п.п.
+        относятся к Giga-480M на плоском индексе). При несовпадении сервис
         отвечает `503 index_fingerprint_mismatch`, а не «как-нибудь ищет».
       operationId: getVersion
       security: []
@@ -505,10 +551,33 @@ components:
           type: array
           items: { type: string }
           description: поля, выставленные оператором вручную; извлечение их не трогает
+        dismissed:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+          description: |
+            Снятые оператором значения: поле → значения. Значение остаётся в
+            `state` (оператор видит его зачёркнутым), но в поиск и в проверку
+            права не попадает и обратно извлечением не возвращается.
+          example: { municipality: ["город Тула"], categories: ["пенсионер"] }
         changed:
           type: object
           additionalProperties: true
           description: "что изменилось на последнем ходу: поле → [было, стало]"
+
+    FactRef:
+      type: object
+      required: [key, value]
+      description: |
+        Ссылка на конкретный факт: поле состояния и его значение. Для
+        `categories` значение — одна категория, а не весь список: снимают
+        «пенсионер», не трогая «многодетный».
+      properties:
+        key:
+          type: string
+          enum: [life_situation, recipient, municipality, age, children, categories]
+        value: { type: string, example: "город Тула" }
 
     QueryFeatures:
       type: object
@@ -586,12 +655,53 @@ components:
 
     Question:
       type: object
-      description: Наводящий вопрос, выбранный по приросту информации. LLM здесь не участвует.
+      description: |
+        Что имеет смысл уточнить у посетителя. LLM здесь не участвует: формулировки
+        написаны человеком, выбор считается арифметикой по кандидатам.
+
+        Список **часто пуст, и это нормальный исход**. Вопрос попадает сюда по одной
+        из двух причин: либо без этого факта не считается вердикт о праве по услуге
+        наверху выдачи (`gain_bits: null`), либо ответ заметно режет список
+        кандидатов. Грань, о которой в диалоге уже сказали, не спрашивается вовсе.
       properties:
         key:       { type: string }
         question:  { type: string }
-        gain_bits: { type: number, description: сколько бит снимает ответ }
+        gain_bits:
+          type: number
+          nullable: true
+          description: |
+            Сколько бит снимает ответ. `null` — вопрос выбран не энтропией, а
+            проверкой права: без этого факта вердикт по услуге не считается.
         splits:    { type: integer }
+        kind:
+          type: string
+          enum: [boolean, choice, number, text]
+          description: |
+            Чем отвечают на вопрос. Клиент НЕ выводит это из текста: разбирать
+            «К какой ситуации это относится: A, B, C?» регуляркой значит
+            разойтись с сервером на первой же правке формулировки.
+        options:
+          type: array
+          description: Варианты ответа для `boolean` и `choice`, готовые к отрисовке.
+          items:
+            type: object
+            properties:
+              value: { nullable: true }
+              label: { type: string }
+        fact:
+          type: string
+          nullable: true
+          enum: [life_situation, recipient, municipality, age, children, categories, null]
+          description: |
+            Поле состояния, которое заполняет ответ. `null` — ответ только
+            переранжирует выдачу.
+
+            Разница не косметическая: переранжирование работает по граням, и
+            ключа `age` оно не знает. Ответ на «Сколько вам полных лет?» без
+            записи в состояние не делает ничего — а вердикт о праве, ради
+            которого вопрос и задан, считается именно по фактам.
+        min: { type: integer, description: "Только для kind=number" }
+        max: { type: integer, description: "Только для kind=number" }
 
     SearchResponse:
       type: object

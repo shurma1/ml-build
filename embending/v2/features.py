@@ -47,12 +47,31 @@ class QueryFeatures:
     recipient: Any = None
     municipality: Any = None
     attributes: list = field(default_factory=list)
+    documents: list = field(default_factory=list)   # что назвал посетитель; в поиск не идёт
     facts: dict = field(default_factory=dict)
     unresolved: list = field(default_factory=list)
     raw_text: str = ''          # ручной ввод или последняя реплика — запасной путь
 
     @classmethod
     def from_llm(cls, d):
+        """Признаки из извлечения.
+
+        `attributes` здесь останется пустым, и это не оплошность вызывающего:
+        поля `attributes` в `extraction_schema.JSON_SCHEMA` нет, а схема отдаётся
+        движку как guided_json — модель физически не может его вернуть. Живо
+        только для `from_text()`, где список заполняет не LLM.
+
+        Названия документов модель возвращает в `documents` — раньше они
+        доходили до `DialogState` и там терялись: ни поиск, ни состояние
+        диалога их не читали, а токены вывода на них тратились каждый ход.
+        Теперь они хотя бы доходят до оператора (`render_state`).
+
+        В энкодер документы СОЗНАТЕЛЬНО не идут. Отдельной поисковой строкой они
+        встали бы в центроид наравне с намерением, то есть при одном намерении
+        забрали бы половину запроса, — а измерить это не на чем: в эталоне из 690
+        запросов извлечения нет. Это кандидат на замер по живому логу, не правка
+        вслепую.
+        """
         d = d or {}
         f = d.get('facts') or {}
         return cls(
@@ -61,6 +80,7 @@ class QueryFeatures:
             recipient=d.get('recipient') if d.get('recipient') in RECIPIENTS else None,
             municipality=d.get('municipality') or None,
             attributes=[s.strip().lower() for s in (d.get('attributes') or []) if s][:8],
+            documents=[s.strip() for s in (d.get('documents') or []) if s and s.strip()][:6],
             facts={k: v for k, v in f.items() if v not in (None, '', [], {})},
             unresolved=list(d.get('unresolved') or []),
             raw_text=d.get('raw_text') or '',

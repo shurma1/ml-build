@@ -28,7 +28,10 @@ async def list_branches():
 async def version():
     """`embed_fingerprint` обязан совпадать с тем, чем собран индекс.
     Несовпадение означает, что индекс и запросы кодируются разными моделями —
-    это молчаливая деградация на 19 п.п. R@1, и сервис её не терпит."""
+    это молчаливая деградация выдачи, которую по ней самой не видно, —
+    и сервис её не терпит. Замеренная цена рассогласования на нынешней
+    конфигурации: -0.7…-1.0 п.п. R@1 (прежние -19 п.п. относятся к Giga-480M
+    на плоском индексе, см. embending/RESULTS.md)."""
     from ..app_state import state
     stored = await db.meta_get("embed_fingerprint")
     fp = stored.get("fingerprint") if isinstance(stored, dict) else stored

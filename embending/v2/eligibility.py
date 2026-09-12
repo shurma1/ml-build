@@ -27,6 +27,49 @@ CHECKABLE_SUBJECT = 'applicant'
 
 _FACT_OF = {'age': 'age', 'children': 'children', 'category': 'categories',
             'recipient_type': 'recipient'}
+
+# Поля, по которым несовпадение НЕ является отказом.
+#
+# Список категорий посетителя заведомо неполон: он назвал то, что вспомнил или о
+# чём спросили, а не всё, что имеет. Замерено на корпусе: произнесённое «я
+# пенсионер» переводит 61 услугу из 318 в blocked, а следующая фраза «и инвалид»
+# возвращает 11 из них обратно. Вердикт, который переворачивается от того, что
+# посетитель успел упомянуть, — это не вердикт.
+#
+# Возраст, число детей и вид заявителя устроены иначе: это одно значение, и если
+# оно названо, несовпадение окончательно. Их отказ остаётся отказом.
+INCOMPLETE_FACTS = {'category'}
+
+# Значения, которых извлечение не может выдать физически: JSON_SCHEMA отдаётся
+# движку как guided_json, и enum в ней жёсткий. Предикат, требующий значения вне
+# enum, не станет истинным НИКОГДА — а поскольку blocked объявляется, когда все
+# альтернативы поля ложны, такой предикат давал гарантированный ложный отказ.
+# На текущей таблице это 12 значений category из 20 («мобилизованный»,
+# «реабилитированные лица», «малоимущие семьи»…) и 4 из 7 значений
+# recipient_type («citizen», «foreign citizen», «patient»…), а всего пять типов,
+# по которым отказ получал любой посетитель, назвавший хоть какую-то категорию,
+# — включая социальную помощь малоимущим и выплату при рождении ребёнка.
+#
+# Сводить их к enum — работа для сборки таблицы, а не для рантайма. Здесь мы
+# лишь отказываемся выносить по ним вердикт: непроверяемое условие даёт unknown
+# и наводящий вопрос, а не отказ.
+def _reachable():
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from extraction_schema import CATEGORIES, RECIPIENTS
+    return {'category': {c.lower() for c in CATEGORIES},
+            'recipient_type': {r.lower() for r in RECIPIENTS}}
+
+
+_REACHABLE = None
+
+
+def reachable_values(field):
+    """Значения поля, которые извлечение способно выдать. None = поле числовое."""
+    global _REACHABLE
+    if _REACHABLE is None:
+        _REACHABLE = _reachable()
+    return _REACHABLE.get(field)
 _WHY = {
     ('age', '>='): 'требуется возраст не менее {v}',
     ('age', '<='): 'услуга предоставляется в возрасте до {v}',
@@ -58,6 +101,10 @@ def load_predicates(path=None):
 
 def _as_list(v):
     return v if isinstance(v, list) else [v]
+
+
+def _values(group):
+    return {str(x).lower() for p in group for x in _as_list(p['value'])}
 
 
 def _holds(op, need, got):
@@ -93,17 +140,32 @@ def check(type_row, facts, source_text=None):
             continue
         got = facts.get(fact_key)
         whys = [_WHY.get((field, p['op']), 'условие: {v}').format(v=p['value']) for p in group]
+        why = ' или '.join(dict.fromkeys(whys))
+        allowed = reachable_values(field)
+        if allowed is not None and not (_values(group) & allowed):
+            # Условие сформулировано значениями, которых извлечение не выдаёт.
+            # Проверить его нечем — говорим «не знаем», а не «не положено».
+            unknown.append({'why': why, 'need_fact': fact_key,
+                            'quote': group[0].get('quote'), 'unverifiable': True})
+            continue
         if got in (None, '', []):
-            unknown.append({'why': ' или '.join(dict.fromkeys(whys)), 'need_fact': fact_key,
+            unknown.append({'why': why, 'need_fact': fact_key,
                             'quote': group[0].get('quote')})
             continue
         results = [_holds(p['op'], p['value'], got) for p in group]
         if any(r is True for r in results):
             continue                                   # хотя бы одна альтернатива подошла
         if all(r is False for r in results):
-            blocked.append({'why': ' или '.join(dict.fromkeys(whys)), 'field': field,
-                            'quote': group[0].get('quote'),
-                            'alternatives': [p['value'] for p in group]})
+            row = {'why': why, 'field': field, 'quote': group[0].get('quote'),
+                   'alternatives': [p['value'] for p in group]}
+            if field in INCOMPLETE_FACTS:
+                # Ни одна из НАЗВАННЫХ категорий не подошла. Это не отказ:
+                # посетитель мог не упомянуть ту, по которой услуга положена.
+                row['need_fact'] = fact_key
+                row['not_among_stated'] = True
+                unknown.append(row)
+            else:
+                blocked.append(row)
     if blocked:
         return 'blocked', blocked
     if unknown:

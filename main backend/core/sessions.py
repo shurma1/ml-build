@@ -49,7 +49,7 @@ def new_dialog_state():
     return DialogState()
 
 
-def render_state(st, pinned, changed=None):
+def render_state(st, pinned, changed=None, dismissed=None):
     """DialogState -> схема DialogState из core-api.yaml."""
     d = st.as_features()
     facts = d.get("facts") or {}
@@ -61,7 +61,15 @@ def render_state(st, pinned, changed=None):
                   "categories": facts.get("categories") or []},
         "intents": d.get("intents") or [],
         "unresolved": d.get("unresolved") or [],
+        # Документы, названные посетителем. Извлечение их возвращало и раньше,
+        # но дальше DialogState они не уходили — модель тратила на них токены
+        # вывода впустую. В поиск они по-прежнему не идут (см. from_llm).
+        "documents": d.get("documents") or [],
         "pinned": sorted(pinned or ()),
+        # Снятое оператором остаётся в состоянии — оператор видит его на экране
+        # зачёркнутым и помнит, что уже отверг. В поиск оно не идёт: за это
+        # отвечает strip_dismissed, а не удаление значения.
+        "dismissed": {k: sorted(v) for k, v in (dismissed or {}).items() if v},
         "changed": changed or {},
     }
 
@@ -82,10 +90,65 @@ def restore_state(snapshot):
         v = facts.get(k)
         if v not in (None, [], ""):
             st.state[k] = v
+    if snap.get("documents"):
+        st.state["documents"] = list(snap["documents"])
     for k in VOLATILE:
         if snap.get(k):
             st.volatile[k] = snap[k]
     return st
+
+
+def restore_dismissed(snapshot):
+    """Снятые оператором значения из снимка: поле -> множество значений.
+
+    Переживают обрыв WS и перезапуск процесса вместе с состоянием: иначе первая
+    же реплика после переподключения вернула бы в поиск факт, от которого
+    оператор при посетителе отказался.
+    """
+    out = {}
+    for k, vals in ((snapshot or {}).get("dismissed") or {}).items():
+        if k in STATE_FIELDS and vals:
+            out[k] = {str(v) for v in vals}
+    return out
+
+
+def without_dismissed(raw, dismissed):
+    """Убрать из свежего извлечения то, что оператор снял в этой сессии.
+
+    Снимается ЗНАЧЕНИЕ, а не поле. Клиент, поправивший себя («не Тула, а
+    Щёкино»), должен быть услышан: блокируется ровно то, что отвергли, —
+    иначе одно нажатие глушило бы поле до конца приёма.
+    """
+    if not dismissed:
+        return raw
+    out = {}
+    for k, v in (raw or {}).items():
+        gone = dismissed.get(k)
+        if not gone:
+            out[k] = v
+        elif isinstance(v, list):
+            kept = [x for x in v if str(x) not in gone]
+            if kept:
+                out[k] = kept
+        elif str(v) not in gone:
+            out[k] = v
+    return out
+
+
+def strip_dismissed(f, dismissed):
+    """Снятый факт не участвует ни в поиске, ни в проверке права — до конца сессии.
+
+    Вычищается на выходе из `_features`, то есть в одной точке: и накопленное
+    состояние, и газеттир запасного пути проходят через неё.
+    """
+    if not dismissed:
+        return f
+    for k in ("life_situation", "recipient", "municipality"):
+        v = getattr(f, k, None)
+        if v is not None and str(v) in (dismissed.get(k) or ()):
+            setattr(f, k, None)
+    f.facts = without_dismissed(f.facts or {}, dismissed)
+    return f
 
 
 class Session:
@@ -101,11 +164,16 @@ class Session:
         self.closed_at = row.get("closed_at")
         self.state = new_dialog_state()
         self.pinned = set()
+        # Снятое оператором: поле -> {значения}. С экрана факт не исчезает,
+        # но в поиск и в проверку права больше не идёт — до конца приёма.
+        self.dismissed = {}
         self.answers = []                 # [(ключ вопроса, ответ)] за весь диалог
         self.seq = 0                      # номер последней реплики
         self.last_changed = {}
         self.last_search = None
         self.turns = []                   # [{seq, text, speaker, source, empty, t0, t1, asr_ms}]
+        # Пауза VAD для этого приёма. None = как настроен шлюз.
+        self.vad_silence_ms = row.get("vad_silence_ms") or (C.ASR_SILENCE_MS or None)
         self.lock = asyncio.Lock()
 
     @property
@@ -124,7 +192,7 @@ class Session:
                 for t in self.turns if not t.get("empty")]
 
     def render(self):
-        return render_state(self.state, self.pinned, self.last_changed)
+        return render_state(self.state, self.pinned, self.last_changed, self.dismissed)
 
 
 class SessionManager:
@@ -142,7 +210,7 @@ class SessionManager:
 
     # --- жизненный цикл -----------------------------------------------------
 
-    async def create(self, branch_id, operator_id, window=None):
+    async def create(self, branch_id, operator_id, window=None, vad_silence_ms=None):
         muni = None
         if branch_id:
             row = await db.fetchrow(
@@ -157,9 +225,11 @@ class SessionManager:
             "RETURNING session_id, branch_id, operator_id, municipality, started_at, closed_at",
             (sid, branch_id, operator_id, window, muni, C.PURGE_DAYS))
         s = Session(row)
+        if vad_silence_ms:
+            s.vad_silence_ms = int(vad_silence_ms)
         self._live[s.id] = s
-        log.info("сессия %s открыта: филиал=%s оператор=%s МО=%s",
-                 s.id, branch_id, operator_id, muni)
+        log.info("сессия %s открыта: филиал=%s оператор=%s МО=%s пауза VAD=%s",
+                 s.id, branch_id, operator_id, muni, s.vad_silence_ms or "как у шлюза")
         return s
 
     async def get(self, session_id, restore=True):
@@ -194,6 +264,7 @@ class SessionManager:
         if fs:
             s.state = restore_state(fs["state"])
             s.pinned = set(fs["pinned"] or ())
+            s.dismissed = restore_dismissed(fs["state"])
             s.last_changed = fs["changed"] or {}
         sl = await db.fetchrow(
             "SELECT features, results, questions, mode, ms, ms_embed FROM search_log "
@@ -282,7 +353,11 @@ class SessionManager:
         llm_ms = int((time.perf_counter() - t0) * 1000)
         async with s.lock:
             # Закреплённое оператором извлечением не перезаписывается — вообще.
-            raw = {k: v for k, v in (facts or {}).items() if k not in s.pinned}
+            # Снятое оператором не возвращается в состояние, даже если модель
+            # назвала его снова: иначе снятая категория всплывала бы обратно
+            # при слиянии списков.
+            raw = without_dismissed(
+                {k: v for k, v in (facts or {}).items() if k not in s.pinned}, s.dismissed)
             changed = s.state.update(raw) if raw else {}
             s.last_changed = {k: list(v) for k, v in changed.items()}
             snapshot = s.render()
@@ -317,6 +392,10 @@ class SessionManager:
         берёт газеттир из текста реплики, а накопленные факты подставляются
         сверху: список станет беднее, но право по-прежнему проверяется по тому,
         что уже известно о клиенте.
+
+        Снятое оператором вычищается на выходе — оба пути проходят через одну
+        точку, включая газеттир: он вытащил бы отвергнутый муниципалитет прямо
+        из реплики заново.
         """
         _v2()
         from features import QueryFeatures
@@ -330,8 +409,9 @@ class SessionManager:
             f.municipality = f.municipality or d.get("municipality")
             f.recipient = f.recipient or d.get("recipient")
             f.facts = {**(d.get("facts") or {}), **(f.facts or {})}
-            return f
-        return QueryFeatures.from_llm(d)
+        else:
+            f = QueryFeatures.from_llm(d)
+        return strip_dismissed(f, s.dismissed)
 
     async def _log_search(self, s, seq, feats, r):
         """search_log — на каждом ходу. Это не отладка, а единственный способ
@@ -361,17 +441,34 @@ class SessionManager:
 
     # --- правки оператором --------------------------------------------------
 
-    async def set_facts(self, s, setter=None, unpin=()):
+    async def set_facts(self, s, setter=None, unpin=(), dismiss=(), restore=()):
         """Ручная правка. Выставленное здесь закрепляется и извлечением не трогается.
 
         Это главная страховка от ошибки атрибуции ролей: диаризации нет, роль
         говорящего выводит LLM, и «у вас двое детей?» от оператора она может
         записать клиенту.
+
+        Второй путь правки — `dismiss`: оператор снимает неверно вытащенный факт
+        одним нажатием на чип. Значение при этом НЕ стирается из состояния —
+        оно остаётся на экране зачёркнутым, чтобы модель, назвав его снова, не
+        заставила оператора снимать одно и то же по второму разу. `restore`
+        возвращает снятое обратно: промах по чипу не должен стоить приёма.
         """
         setter = setter or {}
         async with s.lock:
             for k in unpin or ():
                 s.pinned.discard(k)
+            for ref in dismiss or ():
+                s.dismissed.setdefault(ref["key"], set()).add(ref["value"])
+                # Закрепление защищает значение от извлечения, а здесь от
+                # значения как раз отказались — держать его закреплённым незачем.
+                s.pinned.discard(ref["key"])
+            for ref in restore or ():
+                gone = s.dismissed.get(ref["key"])
+                if gone:
+                    gone.discard(ref["value"])
+                    if not gone:
+                        s.dismissed.pop(ref["key"], None)
             changed = {}
             for k, v in setter.items():
                 if k not in STATE_FIELDS:
@@ -407,13 +504,29 @@ class SessionManager:
         Жёсткий фильтр измерен и хуже: R@1 0.775 против 0.810. Он навсегда
         выбрасывает цель, у которой признак услуги просто не заполнен, —
         а незаполненных признаков в этом корпусе половина.
+
+        Часть вопросов, однако, спрашивает не «какая из услуг», а ФАКТ о
+        посетителе: возраст, число детей, льготную категорию. Такой ответ обязан
+        попасть в состояние диалога, иначе он не делает ничего — переранжирование
+        ключа `age` не знает, и вердикт о праве, ради которого вопрос и задан,
+        не пересчитается. Вопрос несёт поле `fact`, и по нему ответ кладётся в
+        состояние ЗАКРЕПЛЁННЫМ: посетитель ответил прямо, и следующая реплика,
+        разобранная моделью, затирать это не должна.
         """
         async with s.lock:
             by_key = dict(s.answers)
+            facts = {}
             for a in answers:
                 by_key[a["key"]] = a["value"]
+                fact = a.get("fact")
+                if fact in STATE_FIELDS:
+                    facts[fact] = a["value"]
             s.answers = list(by_key.items())
             seq = s.seq
+        if facts:
+            # set_facts сам закрепит поля, разошлёт state.updated и перезапустит
+            # поиск — второй раз его отсюда звать незачем.
+            return (await self.set_facts(s, setter=_fact_values(facts)))["search"]
         search = await self._run_search(s, seq)
         if search:
             hub.emit(s.id, RESULTS_UPDATED, search)
@@ -474,7 +587,13 @@ async def enrich(r, session=None):
             x["card"] = None
         if x.get("needs_municipality") and "available_in" not in x and t:
             x["available_in"] = t.get("municipalities") or []
+        # «МО известен, а карточки для него нет» — состояние, отдельное от
+        # «уточните МО»: уточнять нечего, район уже назван. Список МО здесь нужен
+        # не меньше — оператору есть куда направить посетителя.
+        if x.get("not_in_municipality") and not x.get("available_in") and t:
+            x["available_in"] = t.get("municipalities") or []
         x.setdefault("available_in", [])
+        x.setdefault("not_in_municipality", None)
         x.setdefault("department", None)
     return r
 
@@ -499,6 +618,23 @@ async def corpus_version_str():
     from .catalog import catalog
     v = catalog.version or {}
     return f"{v.get('cards')}c/{v.get('types')}t/{v.get('source_sha')}"
+
+
+def _fact_values(facts):
+    """Ответ из интерфейса -> значение в схеме состояния.
+
+    `categories` в состоянии — список, а кнопка отдаёт одну категорию;
+    «Нет льгот» приходит как null и означает пустой список, а не «не знаем».
+    """
+    out = {}
+    for k, v in facts.items():
+        if k == "categories":
+            out[k] = [] if v in (None, "", []) else (v if isinstance(v, list) else [v])
+        elif k in ("age", "children"):
+            out[k] = None if v in (None, "") else int(v)
+        else:
+            out[k] = v or None
+    return out
 
 
 def _utterance(t):

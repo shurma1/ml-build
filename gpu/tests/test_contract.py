@@ -72,7 +72,7 @@ def test_document_precedes_question_in_ask():
 
 def test_embed_fingerprint_covers_prefix():
     """Смена префикса обязана менять отпечаток. Иначе индекс, собранный со
-    старым префиксом, молча считается совместимым — это -19 п.п. R@1."""
+    старым префиксом, молча считается совместимым."""
     from gpu.gateway import config as C
     from gpu.gateway.embed import fingerprint
     original = C.QUERY_PREFIX

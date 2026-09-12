@@ -138,7 +138,7 @@ class SearchService:
         энтропией. Деградирует именно retrieval, а не вердикт о праве."""
         _v2()
         from eligibility import check as check_eligibility
-        from clarify import suggest, rescore
+        from clarify import suggest, needed_facts, rescore
         from facets import find_municipality
         from aliases import expand_query
 
@@ -192,9 +192,15 @@ class SearchService:
                         "score": round(float(scores.get(tid, best.get(tid, 0.0))), 4),
                         "status": status, "reasons": detail,
                         **d._resolve(tid, muni)})
-        need = sorted({x["need_fact"] for r in out for x in r["reasons"]
-                       if r["status"] == "unknown" and "need_fact" in x})
-        return {"results": out, "questions": suggest(cands[:20], asked=tuple(asked)),
+        need = needed_facts(out)
+        # margin сюда НЕ передаётся намеренно. Гейт clarify.CERTAIN_MARGIN
+        # откалиброван по косинусу эмбеддера, а здесь оценки — ts_rank_cd и
+        # similarity(), другая шкала с другим разбросом. Подставить сюда «отрыв»
+        # значило бы сравнивать метры с секундами и молча глушить вопросы там,
+        # где выдача как раз деградировала и уточнить нужнее всего.
+        questions = suggest(cands[:20], asked=tuple(asked), feats=features,
+                            needed=needed_facts(out, top=3))
+        return {"results": out, "questions": questions,
                 "missing_facts": need, "municipality": muni, "n_intents": len(strings),
                 "ms": round((time.perf_counter() - t0) * 1000, 1), "ms_embed": 0.0}
 
