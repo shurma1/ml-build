@@ -209,9 +209,12 @@
     setErr(d.error || "");
 
     const g = d.gpu || {};
+    const ours = d.vram_ours_mb, reserve = d.vram_reserve_mb;
     dl($("gpu"), [
       ["Устройство", g.name], ["Compute capability", g.compute_capability],
       ["torch", g.torch], ["CUDA", g.cuda], ["Аптайм", fmtSec(d.uptime_s)],
+      ["ASR и эмбеддер заняли", ours == null ? null
+        : `${(ours / 1024).toFixed(1)} из ${(reserve / 1024).toFixed(1)} ГБ резерва`],
     ]);
     if (g.vram_total_mb) {
       const pct = 100 * g.vram_used_mb / g.vram_total_mb;

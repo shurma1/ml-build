@@ -39,6 +39,10 @@ vllm = None
 METRICS = {"asr_segments": 0, "asr_dropped": 0, "embed_texts": 0,
            "llm_extract": 0, "llm_ask": 0, "llm_dropped_keys": 0, "errors": 0}
 STATE = {"asr": False, "embed": False, "llm": False}
+# Сколько видеопамяти реально заняли ASR и эмбеддер — против того, сколько
+# под них зарезервировано. Расхождение видно на странице статуса, и резерв
+# можно сузить переменной RESERVE_GB, освободив память под KV-кэш.
+VRAM = {"ours_mb": None, "reserve_mb": None}
 
 
 def _device():
@@ -88,6 +92,9 @@ async def _sequence():
         secs, note = await vllm.run(p)
         boot.done("vllm", f"поднялся за {secs} с · {note}")
 
+        # Замер собственного потребления: снимок ДО наших моделей, когда
+        # vLLM уже забрал свою долю. Разница и есть то, подо что резервируем.
+        _vram_before = (B.gpu_info().get("vram_used_mb") or 0)
         p = boot.begin("load_asr", f"{C.ASR_REPO} / {C.ASR_VARIANT}")
         dev = _device()
         await loop.run_in_executor(None, asr.load, dev)
@@ -98,6 +105,10 @@ async def _sequence():
         await loop.run_in_executor(None, emb.load, dev)
         STATE["embed"] = True
         boot.done("load_embed", f"dim={emb.dim}, {fingerprint()}")
+
+        ours = (B.gpu_info().get("vram_used_mb") or 0) - _vram_before
+        VRAM["ours_mb"] = max(0, ours)
+        VRAM["reserve_mb"] = int(B.RESERVE_GB * 1024)
 
         boot.begin("probe_llm")
         info = await llm.probe()
@@ -180,6 +191,8 @@ async def status():
     boot.gpu.update({k: v for k, v in B.gpu_info().items() if k.startswith("vram")})
     d = boot.dict(models=await _models_dict())
     d["metrics"] = dict(METRICS)
+    d["vram_ours_mb"] = VRAM["ours_mb"]
+    d["vram_reserve_mb"] = VRAM["reserve_mb"]
     d["vllm_alive"] = bool(boot.vllm_proc and boot.vllm_proc.poll() is None)
     return d
 
