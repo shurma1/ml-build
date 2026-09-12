@@ -150,9 +150,14 @@ class AsrWorker:
     def load(self, device="cuda"):
         from transformers import AutoModel
         from silero_vad import load_silero_vad
+        # revision, а НЕ subfolder: варианты GigaAM (e2e_rnnt, e2e_ctc, rnnt, ctc)
+        # лежат в git-ревизиях репозитория, подкаталогов с такими именами нет.
+        # Точно такой же вызов в sber ctc/realtime_asr.py — он рабочий, и менять
+        # в нём что-либо по памяти не стоило.
+        # Тип данных не навязываем: модель весит 0.4 ГБ, экономить нечего,
+        # а fp16 в чужом remote-code — лишний риск на распознавании речи.
         model = AutoModel.from_pretrained(
-            C.ASR_REPO, trust_remote_code=True, subfolder=C.ASR_VARIANT,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            C.ASR_REPO, revision=C.ASR_VARIANT, trust_remote_code=True,
         ).to(device).eval()
         self.model = Transcriber(model)
         try:

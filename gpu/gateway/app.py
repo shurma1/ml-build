@@ -75,9 +75,9 @@ async def _sequence():
         p.detail = model
         boot.done("download_llm", await loop.run_in_executor(None, B.download, p, model))
 
-        p = boot.begin("download_asr", C.ASR_REPO)
+        p = boot.begin("download_asr", f"{C.ASR_REPO} @ {C.ASR_VARIANT}")
         boot.done("download_asr", await loop.run_in_executor(
-            None, lambda: B.download(p, C.ASR_REPO, ignore_patterns=B.asr_ignore())))
+            None, lambda: B.download(p, C.ASR_REPO, revision=C.ASR_VARIANT)))
 
         p = boot.begin("download_embed", C.EMB_MODEL)
         boot.done("download_embed", await loop.run_in_executor(None, B.download, p, C.EMB_MODEL))

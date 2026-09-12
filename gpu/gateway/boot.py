@@ -106,12 +106,12 @@ class Boot:
 
 # --- прогресс скачивания с HuggingFace ---------------------------------------
 
-def _repo_size(repo, ignore_patterns=None):
+def _repo_size(repo, ignore_patterns=None, revision=None):
     """Сколько весит репозиторий на HuggingFace, с учётом исключённых путей."""
     import fnmatch
     from huggingface_hub import HfApi
     try:
-        info = HfApi().model_info(repo, files_metadata=True, timeout=30)
+        info = HfApi().model_info(repo, files_metadata=True, revision=revision, timeout=30)
     except Exception:
         return 0
     total = 0
@@ -161,7 +161,7 @@ def _watch_download(phase: Phase, repo, stop):
 
 
 def download(phase: Phase, repo, **kw):
-    phase.total = _repo_size(repo, kw.get("ignore_patterns"))
+    phase.total = _repo_size(repo, kw.get("ignore_patterns"), kw.get("revision"))
     phase.detail = (f"{repo} · {phase.total/2**30:.1f} ГБ" if phase.total else repo)
     stop = threading.Event()
     threading.Thread(target=_watch_download, args=(phase, repo, stop), daemon=True).start()
@@ -173,13 +173,10 @@ def download(phase: Phase, repo, **kw):
     return f"{repo} · {_dir_size(path)/2**30:.1f} ГБ на диске"
 
 
-# Варианты GigaAM, которые нам не нужны. Репозиторий содержит четыре сборки;
-# качать все — это лишние ~4 ГБ диска на модели, которые никогда не загрузятся.
+# Варианты GigaAM — это git-РЕВИЗИИ репозитория, а не подкаталоги.
+# Значит лишнего не скачается само собой: snapshot_download с revision
+# берёт только нужную ветку. Прежний фильтр по подкаталогам был пустышкой.
 ASR_VARIANTS = ["e2e_rnnt", "e2e_ctc", "rnnt", "ctc"]
-
-
-def asr_ignore():
-    return [f"{v}/*" for v in ASR_VARIANTS if v != C.ASR_VARIANT]
 
 
 # --- vLLM как дочерний процесс ------------------------------------------------
