@@ -144,6 +144,7 @@ class AsrWorker:
         self.model = None
         self.vad = None
         self.ready = False
+        self.load_mode = None
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr")
         self._lock = threading.Lock()
 
@@ -152,13 +153,10 @@ class AsrWorker:
         from silero_vad import load_silero_vad
         # revision, а НЕ subfolder: варианты GigaAM (e2e_rnnt, e2e_ctc, rnnt, ctc)
         # лежат в git-ревизиях репозитория, подкаталогов с такими именами нет.
-        # Точно такой же вызов в sber ctc/realtime_asr.py — он рабочий, и менять
-        # в нём что-либо по памяти не стоило.
-        # Тип данных не навязываем: модель весит 0.4 ГБ, экономить нечего,
+        # Тип данных не навязываем: модель весит 0.42 ГБ, экономить нечего,
         # а fp16 в чужом remote-code — лишний риск на распознавании речи.
-        model = AutoModel.from_pretrained(
-            C.ASR_REPO, revision=C.ASR_VARIANT, trust_remote_code=True,
-        ).to(device).eval()
+        model = self._from_pretrained()
+        model = model.to(device).eval()
         self.model = Transcriber(model)
         try:
             self.vad = load_silero_vad(onnx=True)
@@ -168,6 +166,40 @@ class AsrWorker:
         # секунд. Без него они достанутся первому живому посетителю.
         self.model(np.zeros(C.SAMPLE_RATE, dtype=np.float32))
         self.ready = True
+
+    def _from_pretrained(self):
+        """Загрузка с отключённой meta-инициализацией.
+
+        transformers 5.x собирает модель на устройстве `meta` и материализует
+        веса потом. GigaAM так не умеет: его FeatureExtractor создаёт в
+        конструкторе настоящий мел-фильтр через torchaudio, то есть реальный
+        тензор на cpu внутри meta-контекста, и падает с
+        "Tensor on device cpu is not on the expected device meta!".
+
+        Версию transformers не зафиксировать — её выбирает vllm. Поэтому
+        перебираем способы отключить meta-путь: набор аргументов у
+        from_pretrained меняется между версиями, и один жёстко зашитый
+        вызов снова сломается на следующей.
+        """
+        from transformers import AutoModel
+        base = dict(revision=C.ASR_VARIANT, trust_remote_code=True)
+        attempts = [
+            ("low_cpu_mem_usage=False", dict(low_cpu_mem_usage=False, device_map=None)),
+            ("low_cpu_mem_usage только",  dict(low_cpu_mem_usage=False)),
+            ("без дополнительных аргументов", {}),
+        ]
+        errors = []
+        for name, extra in attempts:
+            try:
+                model = AutoModel.from_pretrained(C.ASR_REPO, **base, **extra)
+                self.load_mode = name
+                return model
+            except TypeError as e:          # аргумент выпилили в этой версии
+                errors.append(f"{name}: {e}")
+            except RuntimeError as e:       # meta/cpu и прочее из самой модели
+                errors.append(f"{name}: {e}")
+        raise RuntimeError("GigaAM не загрузился ни одним способом:\n  " +
+                           "\n  ".join(errors))
 
     def stream(self, offset=0.0) -> VadStream:
         return VadStream(self.vad, offset)
@@ -179,7 +211,8 @@ class AsrWorker:
         return text, round((time.perf_counter() - t0) * 1000)
 
     def info(self):
-        return {"repo": C.ASR_REPO, "variant": C.ASR_VARIANT, "ready": self.ready}
+        return {"repo": C.ASR_REPO, "variant": C.ASR_VARIANT,
+                "ready": self.ready, "load_mode": self.load_mode}
 
 
 def pcm16_to_float32(raw: bytes) -> np.ndarray:
