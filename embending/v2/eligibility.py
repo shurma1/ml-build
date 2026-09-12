@@ -134,10 +134,12 @@ def check(type_row, facts, source_text=None):
         by_field.setdefault(p['field'], []).append(p)
 
     blocked, unknown = [], []
+    checkable = False
     for field, group in by_field.items():
         fact_key = _FACT_OF.get(field)
         if not fact_key:
             continue
+        checkable = True
         got = facts.get(fact_key)
         whys = [_WHY.get((field, p['op']), 'условие: {v}').format(v=p['value']) for p in group]
         why = ' или '.join(dict.fromkeys(whys))
@@ -170,6 +172,17 @@ def check(type_row, facts, source_text=None):
         return 'blocked', blocked
     if unknown:
         return 'unknown', unknown
+    if not checkable:
+        # Условия к заявителю ЕСТЬ, но все — по полям, фактов о которых извлечение
+        # не выдаёт ('residence', 'other'…). Пропуск таких групп означал зелёный
+        # «положено» для услуги, чьё требование мы даже не читали: загранпаспорт
+        # («Гражданин Российской Федерации…») светился как доступный иностранцу.
+        # Честный ответ — unknown с дословной цитатой: оператор сам сверит её
+        # с посетителем. need_fact здесь НЕТ сознательно: факта для этого поля
+        # не существует, и наводящий вопрос был бы безвариантным.
+        return 'unknown', [{'why': 'требование к заявителю не проверяется автоматически',
+                            'quote': next((p.get('quote') for p in preds if p.get('quote')), None),
+                            'unverifiable': True}]
     return 'eligible', []
 
 

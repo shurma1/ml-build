@@ -77,7 +77,7 @@ async def get_service(service_id: str, session_id: str = None):
 @router.post("/{service_id}/ask")
 async def ask_service(service_id: str, body: dict, request: Request):
     """Проксируется в SSE шлюза как есть. Ответ заземлён на одну карточку:
-    чего в регламенте нет — «в регламенте не указано», без догадок."""
+    всегда с цитатой из документа, без догадок и без отписок."""
     card = catalog.card_by_id.get(service_id)
     if not card:
         raise ApiError("service_not_found", f"услуга {service_id} не найдена")
@@ -90,7 +90,7 @@ async def ask_service(service_id: str, body: dict, request: Request):
     if not isinstance(history, list) or len(history) > 20:
         raise ApiError("schema_validation_failed", "history: до 20 сообщений")
 
-    document = catalog.raw_fields(service_id)
+    document = _ask_document(service_id)
     if not gateway.configured:
         raise ApiError("gpu_unavailable", "gpu-шлюз недоступен: вопросы по документу выключены")
 
@@ -117,6 +117,49 @@ async def ask_service(service_id: str, body: dict, request: Request):
 
 def _sse(event, payload):
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _ask_document(service_id):
+    """Регламент для модели = сырые текстовые поля + структурные факты карточки.
+
+    Модель отвечает только о том, что ей дали.
+    А карточка на экране печатает ведомство, число отделений и правовое
+    основание: они берутся из структурных полей выгрузки (departmentName,
+    mfcCount) и из разбора cardview, которых среди сырых текстов нет.
+    Оператор своими глазами видит «124 отделения», спрашивает модель и получает
+    отказ — и перестаёт верить ответам. Документ для модели и карточка на экране
+    обязаны собираться из одних данных.
+
+    Секции-добавки названы по-русски и отделены от сырых полей: смещения цитат
+    считаются по тексту секции, а интерфейс печатает только текст цитаты,
+    поэтому на подсветку это не влияет.
+    """
+    raw = catalog.raw.get(service_id) or {}
+    card = catalog.card_by_id.get(service_id) or {}
+    view = catalog.view(service_id) or {}
+    doc = dict(catalog.raw_fields(service_id))
+    if raw.get("departmentName"):
+        doc["Ведомство"] = raw["departmentName"]
+    if card.get("municipality"):
+        doc["Муниципальное образование"] = card["municipality"]
+    if raw.get("mfcCount") is not None:
+        # Фразой, а не голым числом: измерено на этой же модели — «## Число
+        # отделений МФЦ\n124» она отвечала «в регламенте не указано», а полное
+        # предложение из того же числа цитирует без вопросов.
+        doc["Число отделений МФЦ"] = (
+            f"Количество отделений МФЦ, в которых можно получить услугу: "
+            f"{raw['mfcCount']}.")
+    life = raw.get("lifeSituationNames") or []
+    if life:
+        # Те же метки, что интерфейс печатает в карточке, и тот же ответ на
+        # косвенный вопрос («а если потерял?»): слово «утрата» живёт не в
+        # тексте регламента, а в классификаторе услуги. Без этой секции
+        # регламент честно молчал о сценариях, для которых услугу и берут.
+        doc["Жизненные ситуации услуги"] = (
+            "Эта услуга относится к жизненным ситуациям: " + ", ".join(life) + ".")
+    if view.get("legalBasis"):
+        doc["Правовое основание"] = view["legalBasis"]
+    return doc
 
 
 async def _branches(service_id):

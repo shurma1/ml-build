@@ -10,6 +10,7 @@
 Разделение обязательно: услугу, на которую клиент не имеет права, всё равно надо
 найти и показать с причиной отказа. Фильтр по праву на этапе поиска её потеряет.
 """
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +75,15 @@ class QueryFeatures:
         """
         d = d or {}
         f = d.get('facts') or {}
+        facts = {k: v for k, v in f.items() if v not in (None, '', [], {})}
+        raw = d.get('raw_text') or ''
+        if 'age' not in facts and raw:
+            import os, sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from facets import find_age
+            age = find_age(raw)
+            if age is not None:
+                facts['age'] = age
         return cls(
             intents=[s.strip() for s in (d.get('intents') or []) if s and s.strip()][:4],
             life_situation=d.get('life_situation') or None,
@@ -81,9 +91,9 @@ class QueryFeatures:
             municipality=d.get('municipality') or None,
             attributes=[s.strip().lower() for s in (d.get('attributes') or []) if s][:8],
             documents=[s.strip() for s in (d.get('documents') or []) if s and s.strip()][:6],
-            facts={k: v for k, v in f.items() if v not in (None, '', [], {})},
+            facts=facts,
             unresolved=list(d.get('unresolved') or []),
-            raw_text=d.get('raw_text') or '',
+            raw_text=raw,
         )
 
     @classmethod
@@ -91,9 +101,12 @@ class QueryFeatures:
         """Ручной ввод: одна строка — одно намерение. Фасеты добираются газеттиром."""
         import sys, os
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from facets import find_municipality, find_recipient
+        from facets import find_municipality, find_recipient, find_age
+        age = find_age(text)
         return cls(intents=[text.strip()], municipality=find_municipality(text),
-                   recipient=find_recipient(text), raw_text=text)
+                   recipient=find_recipient(text),
+                   facts={'age': age} if age is not None else {},
+                   raw_text=text)
 
     def search_strings(self):
         """Строки, которые пойдут в энкодер. Батчем — одна прогонка вместо N."""
@@ -104,6 +117,11 @@ class QueryFeatures:
             out.append(self.raw_text)
         if self.life_situation:
             out = [f'{s}. {self.life_situation}' if i == 0 else s for i, s in enumerate(out)]
+        blob = ' '.join(out + [self.raw_text or '']).lower()
+        if re.search(r'паспорт', blob) and not re.search(
+                r'загран|за границ|за рубеж|за пределами', blob):
+            out.append('выдача замена паспорта гражданина Российской Федерации '
+                       'на территории Российской Федерации')
         return out[:5]
 
 

@@ -193,6 +193,8 @@ def answered(feats):
     categories = facts.get('categories') or []
     if categories:
         out.add('льгота')
+    if facts.get('age') is not None:
+        out.add('age')
     if facts.get('children') is not None or 'многодетный' in categories:
         out.add('ребенок')
     if getattr(feats, 'recipient', None) in ('ip', 'organization'):

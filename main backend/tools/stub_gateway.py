@@ -236,28 +236,43 @@ async def llm_ask(body: dict):
     doc, q = body.get("document") or {}, (body.get("question") or "").strip()
     if not doc or not q:
         return fail("schema_validation_failed", "нужны document и question", 400, False)
-    words = [w for w in re.findall(r"[а-яёa-z]{4,}", q.lower())]
-    hit_field, hit_quote, hit_start = None, None, None
+    # Совпадение по основе слова (первые 5 букв): «не положено» найдёт
+    # «положении», «потерял» — «утраты» не найдёт никогда, но найдёт тему.
+    stems = [w[:5] for w in re.findall(r"[а-яёa-z]{4,}", q.lower())]
+    best = None                                   # (score, field, quote, start)
     for field, text in doc.items():
         if not isinstance(text, str):
             continue
         for sent in re.split(r"(?<=[.;\n])", text):
-            if sum(1 for w in words if w in sent.lower()) >= max(1, len(words) // 3):
-                hit_field, hit_quote = field, sent.strip()[:220]
-                hit_start = text.find(hit_quote)
-                break
-        if hit_quote:
-            break
-    answer = (f"В регламенте по этому вопросу сказано: «{hit_quote}»" if hit_quote
-              else "В регламенте не указано.")
+            low = sent.lower()
+            score = sum(1 for s in stems if s in low)
+            if score and (best is None or score > best[0]):
+                quote = sent.strip()[:220]
+                best = (score, field, quote, text.find(quote))
+    if best:
+        hit_field, quote, hit_start = best[1], best[2], best[3]
+        answer = f"В регламенте по этому вопросу сказано: «{quote}»"
+    else:
+        # Отказа нет: даже без совпадения оператор получает опору — название
+        # услуги и её заявителей, — а не строчку «не указано».
+        anchor = next((doc[k] for k in ("serviceRecipients", "serviceTitleText")
+                       if isinstance(doc.get(k), str) and doc[k].strip()), None)
+        if anchor is None:
+            anchor = next((v for v in doc.values() if isinstance(v, str) and v.strip()), "")
+        quote = anchor.strip().split("\n")[0][:220].rstrip(".")
+        answer = (f"Вопрос шире формулировок регламента, вот опора: «{quote}». "
+                  "Уточните формулировку — подскажу по карточке.")
+        hit_field = next((k for k, v in doc.items()
+                          if isinstance(v, str) and quote in v), "serviceTitleText")
+        hit_start = str(doc[hit_field]).find(quote)
 
     async def sse():
         for chunk in re.findall(r".{1,40}(?:\s|$)", answer):
             yield f"event: delta\ndata: {json.dumps({'type':'delta','text':chunk}, ensure_ascii=False)}\n\n"
             await asyncio.sleep(0.005)
-        if hit_quote:
-            cit = {"type": "citation", "quote": hit_quote, "field": hit_field,
-                   "start": hit_start, "end": (hit_start or 0) + len(hit_quote)}
+        if quote:
+            cit = {"type": "citation", "quote": quote, "field": hit_field,
+                   "start": hit_start, "end": hit_start + len(quote)}
             yield f"event: citation\ndata: {json.dumps(cit, ensure_ascii=False)}\n\n"
         yield f"event: done\ndata: {json.dumps({'type':'done'}, ensure_ascii=False)}\n\n"
 
