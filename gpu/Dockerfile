@@ -34,9 +34,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # старте, готового в колесе нет. База runtime компилятора не содержит —
 # первый запуск падал на «/usr/local/cuda/bin/nvcc: not found».
 # Ставим сам nvcc и заголовки CUDA, а не переходим на базу devel: так дешевле.
+# curand и cublas — отдельными пакетами: одного nvcc мало, модуль семплирования
+# FlashInfer включает <curand.h> и без него падает уже на прогреве ядер.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv python3-dev build-essential \
       cuda-nvcc-13-0 cuda-cudart-dev-13-0 \
+      libcurand-dev-13-0 libcublas-dev-13-0 \
       curl ca-certificates git openssh-server \
  && rm -rf /var/lib/apt/lists/* \
  && python3 -m venv /opt/mfc/venv \

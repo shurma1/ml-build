@@ -252,10 +252,16 @@ class VllmProcess:
             self.log = open(self.log_path, "ab", buffering=0)
         cmd = self._cmd()
         self.boot.vllm_tail.append("$ " + " ".join(cmd))
+        env = {**os.environ, "HF_HOME": os.getenv("HF_HOME", "/workspace/hf")}
+        # Семплирование штатным PyTorch вместо FlashInfer. Тот компилирует свой
+        # модуль при первом запуске, и это минуты простоя плюс лишний класс
+        # отказов (нужны заголовки curand). На нашей нагрузке — 80 токенов
+        # на извлечение фактов под жёсткой грамматикой — разницы в скорости нет.
+        # Переопределяется переменной окружения, если захочется обратно.
+        env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, bufsize=1,
-                                     universal_newlines=True,
-                                     env={**os.environ, "HF_HOME": os.getenv("HF_HOME", "/workspace/hf")})
+                                     universal_newlines=True, env=env)
         self.boot.vllm_proc = self.proc
         return self.proc
 
