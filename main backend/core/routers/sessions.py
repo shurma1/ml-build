@@ -340,10 +340,22 @@ def _turn(t):
 
 
 def _ws_url(request, session_id):
+    """Адрес WebSocket для клиента.
+
+    За реверс-прокси адрес сокета и адрес, по которому core-api себя видит, —
+    разные вещи: сервер видит апстрим (127.0.0.1:8080), а браузеру нужен
+    внешний адрес. Отдать первый значит послать клиента мимо прокси — то есть
+    мимо подстановки токена, и соединение будет отклонено.
+
+    Поэтому учитываются стандартные заголовки прокси. `PUBLIC_WS_BASE`
+    остаётся ручным переопределением для схем, где заголовки не проставляются.
+    """
     if C.PUBLIC_WS_BASE:
         return f"{C.PUBLIC_WS_BASE.rstrip('/')}/v1/sessions/{session_id}/stream"
-    scheme = "wss" if request.url.scheme == "https" else "ws"
-    return f"{scheme}://{request.url.netloc}/v1/sessions/{session_id}/stream"
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    scheme = "wss" if (proto or request.url.scheme) == "https" else "ws"
+    return f"{scheme}://{host or request.url.netloc}/v1/sessions/{session_id}/stream"
 
 
 async def _corpus_version():

@@ -18,6 +18,12 @@ import pytest
 CORE = os.getenv("CORE_URL", "http://127.0.0.1:8080")
 STUB = os.getenv("STUB_URL", "http://127.0.0.1:10100")
 STUB2 = os.getenv("STUB2_URL", "http://127.0.0.1:10101")
+# Сервер может быть поднят с закрытым публичным доступом — набор обязан
+# проходить в обеих конфигурациях, иначе «зелёные тесты» ничего не значат
+# ровно там, где стоит прод. Объявлено ДО _жив(): его зовёт pytestmark
+# на импорте модуля.
+API_TOKEN = os.getenv("API_TOKEN", "")
+AUTH = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
 SECRET = os.getenv("ADMIN_SECRET", "0123456789012345678901234567890123")
 H = {"X-Admin-Secret": SECRET}
 
@@ -41,8 +47,12 @@ def адрес():
 def _жив(url):
     try:
         return httpx.get(f"{url}/v1/health" if "8080" in url else f"{url}/readyz",
+                         headers=AUTH if "8080" in url else None,
                          timeout=3).status_code == 200
-    except Exception:                                            # noqa: BLE001
+    except httpx.HTTPError:
+        # Именно сетевая недоступность. Всё остальное (опечатка, NameError)
+        # обязано падать громко: иначе весь набор молча «пропускается»
+        # и выглядит зелёным.
         return False
 
 
@@ -55,7 +65,7 @@ STUB2_TOKEN = os.getenv("STUB2_TOKEN", "second-token-xyz")
 
 @pytest.fixture(scope="module")
 def c():
-    return httpx.Client(base_url=CORE, timeout=60)
+    return httpx.Client(base_url=CORE, timeout=60, headers=AUTH)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -240,7 +250,7 @@ def test_вопрос_по_документу_отдаёт_sse(c):
     sid = next((x["service_id"] for x in r["results"] if x["service_id"]), None)
     if not sid:
         pytest.skip("в выдаче нет карточки с определённым муниципалитетом")
-    with httpx.stream("POST", f"{CORE}/v1/services/{sid}/ask",
+    with httpx.stream("POST", f"{CORE}/v1/services/{sid}/ask", headers=AUTH,
                       json={"question": "кому положена услуга?"}, timeout=60) as resp:
         assert resp.status_code == 200
         события = [l for l in resp.iter_lines() if l.startswith("event:")]

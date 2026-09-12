@@ -12,6 +12,7 @@
 """
 import asyncio
 import os
+import threading
 import re
 import shutil
 import subprocess
@@ -105,55 +106,71 @@ class Boot:
 
 # --- прогресс скачивания с HuggingFace ---------------------------------------
 
-def hf_tqdm(phase: Phase):
-    """Подменяет прогресс-бар huggingface_hub, чтобы цифры попадали в статус.
+def _repo_size(repo, ignore_patterns=None):
+    """Сколько весит репозиторий на HuggingFace, с учётом исключённых путей."""
+    import fnmatch
+    from huggingface_hub import HfApi
+    try:
+        info = HfApi().model_info(repo, files_metadata=True, timeout=30)
+    except Exception:
+        return 0
+    total = 0
+    for f in (info.siblings or []):
+        if any(fnmatch.fnmatch(f.rfilename, p) for p in (ignore_patterns or [])):
+            continue
+        total += f.size or 0
+    return total
 
-    Считаем только байтовые бары: snapshot_download заводит ещё один, внешний,
-    со счётчиком файлов — если сложить его с байтами, получится бессмыслица.
+
+def _local_dir(repo):
+    """Куда huggingface_hub кладёт файлы репозитория."""
+    home = os.getenv("HF_HOME", "/workspace/hf")
+    return os.path.join(home, "hub", "models--" + repo.replace("/", "--"))
+
+
+def _dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _watch_download(phase: Phase, repo, stop):
+    """Прогресс считаем по РАЗМЕРУ ПАПКИ НА ДИСКЕ, а не по прогресс-барам.
+
+    Первая версия подменяла tqdm внутри snapshot_download — и показывала ноль
+    всё время загрузки. Свой класс получает только внешний бар со счётчиком
+    файлов; побайтовые бары отдельных файлов его не видят, а при включённом
+    hf_transfer загрузка вообще идёт в Rust и рапортует мимо tqdm.
+    Размер папки не зависит ни от версии библиотеки, ни от способа качать.
     """
-    from tqdm.auto import tqdm as base
-
-    bars = {}
-
-    class T(base):
-        def __init__(self, *a, **k):
-            k["disable"] = True                 # в лог не печатаем, статус и так есть
-            super().__init__(*a, **k)
-            if getattr(self, "unit", "") == "B":
-                bars[id(self)] = self
-                self._sync()
-
-        def update(self, n=1):
-            r = super().update(n)
-            if id(self) in bars:
-                self._sync()
-            return r
-
-        def close(self):
-            if id(self) in bars:
-                self._sync()
-                bars.pop(id(self), None)
-            return super().close()
-
-        @staticmethod
-        def _sync():
-            done = sum(b.n or 0 for b in bars.values())
-            total = sum(b.total or 0 for b in bars.values())
-            phase.bytes, phase.total = done, total
-            phase.progress = (done / total) if total else -1.0
-            if total:
-                phase.detail = f"{done/2**30:.1f} из {total/2**30:.1f} ГБ"
-
-    return T
+    path = _local_dir(repo)
+    while not stop.wait(2.0):
+        done = _dir_size(path)
+        phase.bytes = done
+        if phase.total:
+            phase.progress = min(0.999, done / phase.total)
+            phase.detail = f"{done/2**30:.1f} из {phase.total/2**30:.1f} ГБ"
+        else:
+            phase.progress = -1.0
+            phase.detail = f"{done/2**30:.1f} ГБ"
 
 
 def download(phase: Phase, repo, **kw):
-    from huggingface_hub import snapshot_download
-    path = snapshot_download(repo, tqdm_class=hf_tqdm(phase), max_workers=8, **kw)
-    size = sum(os.path.getsize(os.path.join(r, f))
-               for r, _, fs in os.walk(path) for f in fs
-               if os.path.exists(os.path.join(r, f)))
-    return f"{repo} · {size/2**30:.1f} ГБ на диске"
+    phase.total = _repo_size(repo, kw.get("ignore_patterns"))
+    phase.detail = (f"{repo} · {phase.total/2**30:.1f} ГБ" if phase.total else repo)
+    stop = threading.Event()
+    threading.Thread(target=_watch_download, args=(phase, repo, stop), daemon=True).start()
+    try:
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(repo, max_workers=8, **kw)
+    finally:
+        stop.set()
+    return f"{repo} · {_dir_size(path)/2**30:.1f} ГБ на диске"
 
 
 # Варианты GigaAM, которые нам не нужны. Репозиторий содержит четыре сборки;
