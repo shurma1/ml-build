@@ -37,6 +37,13 @@ class Transcriber:
     """
 
     def __init__(self, model):
+        # AutoModel отдаёт ОБЁРТКУ GigaAMModel (PreTrainedModel), а настоящая
+        # модель с decoding и head лежит внутри, в .model — это GigaAMASR.
+        # Без разворачивания hasattr(model, "decoding") ложен, и прямой путь
+        # оказывается недоступен на ровном месте.
+        inner = getattr(model, "model", None)
+        if inner is not None and hasattr(inner, "decoding") and hasattr(inner, "head"):
+            model = inner
         self.model = model
         p = next(model.parameters())
         self.device, self.dtype = p.device, p.dtype
@@ -45,7 +52,9 @@ class Transcriber:
     @torch.inference_mode()
     def __call__(self, wav):
         if not self._direct:                      # незнакомая сборка модели
-            raise RuntimeError("модель без decoding/head — путь через тензор недоступен")
+            raise RuntimeError(
+                f"у {type(self.model).__name__} нет decoding/head — структура модели "
+                "изменилась, путь через тензор недоступен")
         x = torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32))
         x = x.to(self.device, self.dtype).unsqueeze(0)
         length = torch.tensor([x.shape[-1]], device=self.device)
@@ -168,38 +177,52 @@ class AsrWorker:
         self.ready = True
 
     def _from_pretrained(self):
-        """Загрузка с отключённой meta-инициализацией.
+        """Сборка из конфига + ручная загрузка весов, в обход from_pretrained.
 
-        transformers 5.x собирает модель на устройстве `meta` и материализует
-        веса потом. GigaAM так не умеет: его FeatureExtractor создаёт в
-        конструкторе настоящий мел-фильтр через torchaudio, то есть реальный
-        тензор на cpu внутри meta-контекста, и падает с
+        transformers 5.x строит модель на устройстве `meta` и материализует
+        веса потом. GigaAM так не умеет: FeatureExtractor создаёт в
+        конструкторе настоящий мел-фильтр через torchaudio — реальный тензор
+        на cpu внутри meta-контекста, отсюда
         "Tensor on device cpu is not on the expected device meta!".
 
-        Версию transformers не зафиксировать — её выбирает vllm. Поэтому
-        перебираем способы отключить meta-путь: набор аргументов у
-        from_pretrained меняется между версиями, и один жёстко зашитый
-        вызов снова сломается на следующей.
+        Проверено перебором на transformers 5.17 (шесть вариантов):
+        голый вызов, low_cpu_mem_usage=False, он же с device_map=None,
+        _fast_init=False, контекст torch.device("cpu"), set_default_device —
+        ПАДАЮТ ВСЕ. Аргумент low_cpu_mem_usage в пятой версии этим путём
+        больше не управляет, хотя по названию кажется, что должен.
+
+        Работает только полный обход: from_config строит модель обычным
+        способом, веса грузятся отдельно. Версию transformers при этом
+        не зафиксировать — её выбирает vllm.
         """
-        from transformers import AutoModel
-        base = dict(revision=C.ASR_VARIANT, trust_remote_code=True)
-        attempts = [
-            ("low_cpu_mem_usage=False", dict(low_cpu_mem_usage=False, device_map=None)),
-            ("low_cpu_mem_usage только",  dict(low_cpu_mem_usage=False)),
-            ("без дополнительных аргументов", {}),
-        ]
-        errors = []
-        for name, extra in attempts:
-            try:
-                model = AutoModel.from_pretrained(C.ASR_REPO, **base, **extra)
-                self.load_mode = name
-                return model
-            except TypeError as e:          # аргумент выпилили в этой версии
-                errors.append(f"{name}: {e}")
-            except RuntimeError as e:       # meta/cpu и прочее из самой модели
-                errors.append(f"{name}: {e}")
-        raise RuntimeError("GigaAM не загрузился ни одним способом:\n  " +
-                           "\n  ".join(errors))
+        import torch
+        from huggingface_hub import hf_hub_download
+        from transformers import AutoConfig, AutoModel
+
+        cfg = AutoConfig.from_pretrained(
+            C.ASR_REPO, revision=C.ASR_VARIANT, trust_remote_code=True)
+        model = AutoModel.from_config(cfg, trust_remote_code=True)
+
+        path = hf_hub_download(C.ASR_REPO, "pytorch_model.bin", revision=C.ASR_VARIANT)
+        try:
+            sd = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception:
+            # В чекпойнте не только тензоры. Доверие то же: remote-code этого
+            # репозитория мы и так исполняем, отдельного риска здесь нет.
+            sd = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(sd, dict):
+            sd = sd.state_dict()
+
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        # Молчать здесь нельзя. Частично загруженная модель распознавания
+        # не падает — она выдаёт правдоподобный мусор вместо текста,
+        # и обнаружится это уже в диалоге с посетителем.
+        if missing or unexpected:
+            raise RuntimeError(
+                f"веса GigaAM не сошлись со схемой: не найдено {len(missing)}, "
+                f"лишних {len(unexpected)}; первые пропуски: {missing[:3]}")
+        self.load_mode = "from_config + load_state_dict"
+        return model
 
     def stream(self, offset=0.0) -> VadStream:
         return VadStream(self.vad, offset)
