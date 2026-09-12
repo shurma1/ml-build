@@ -128,12 +128,20 @@ def _local_dir(repo):
     return os.path.join(home, "hub", "models--" + repo.replace("/", "--"))
 
 
-def _dir_size(path):
+def _dir_size(path, follow=False):
+    """Размер папки. follow=False меряет ссылки как ссылки.
+
+    Внутри hub-кэша реальные файлы лежат в blobs/, а snapshots/ — это ссылки
+    на них. Для прогресса считаем весь кэш репозитория без follow (иначе
+    удвоится), для итогового отчёта — тоже его, а не папку снимка: она из
+    одних ссылок и давала честные, но бессмысленные 0.0 ГБ.
+    """
+    stat = os.stat if follow else os.lstat
     total = 0
     for root, _, files in os.walk(path):
         for f in files:
             try:
-                total += os.lstat(os.path.join(root, f)).st_size
+                total += stat(os.path.join(root, f)).st_size
             except OSError:
                 pass
     return total
@@ -167,10 +175,10 @@ def download(phase: Phase, repo, **kw):
     threading.Thread(target=_watch_download, args=(phase, repo, stop), daemon=True).start()
     try:
         from huggingface_hub import snapshot_download
-        path = snapshot_download(repo, max_workers=8, **kw)
+        snapshot_download(repo, max_workers=8, **kw)
     finally:
         stop.set()
-    return f"{repo} · {_dir_size(path)/2**30:.1f} ГБ на диске"
+    return f"{repo} · {_dir_size(_local_dir(repo))/2**30:.1f} ГБ на диске"
 
 
 # Варианты GigaAM — это git-РЕВИЗИИ репозитория, а не подкаталоги.

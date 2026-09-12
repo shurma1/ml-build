@@ -16,6 +16,16 @@ soundfile>=0.12
 soxr>=0.5
 numpy>=2.0
 
+# Только ради статической проверки импортов в trust_remote_code.
+# modeling_gigaam.py ссылается на pyannote ВНУТРИ функции, которая строит
+# собственный VAD для длинного аудио. Мы её не вызываем никогда: нарезку
+# делает Silero, а GigaAM получает готовые реплики до 12 секунд.
+# Но transformers сканирует файл статически и требует все импорты, даже
+# недостижимые. Ставим pyannote.core (numpy, pandas, sortedcontainers),
+# а НЕ pyannote.audio: тот тянет torch>=2.8, lightning и ещё 27 пакетов
+# и переставил бы torch — ровно то, от чего защищаются две фазы в Dockerfile.
+pyannote.core>=6.0
+
 # remote code GigaAM-v3 (modeling_gigaam.py)
 hydra-core>=1.3
 omegaconf>=2.3
