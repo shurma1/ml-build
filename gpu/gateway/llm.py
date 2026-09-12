@@ -34,6 +34,10 @@ def _struct_body(mode, schema):
     return {}
 
 
+# Qwen3.5 думает вслух по умолчанию: <think> уходит в чат и съедает max_tokens.
+_NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
 class LlmClient:
     def __init__(self):
         self.http = httpx.AsyncClient(base_url=C.VLLM_URL, timeout=C.LLM_TIMEOUT)
@@ -65,7 +69,7 @@ class LlmClient:
         msgs = [{"role": "user", "content": "Верни {\"ok\": true}"}]
         for mode in ("guided", "response_format"):
             body = {"model": self.model, "messages": msgs, "max_tokens": 16,
-                    "temperature": 0, **_struct_body(mode, tiny)}
+                    "temperature": 0, **_NO_THINK, **_struct_body(mode, tiny)}
             try:
                 r = await self.http.post("/v1/chat/completions", json=body)
                 if r.status_code == 200:
@@ -87,6 +91,7 @@ class LlmClient:
             "messages": prompts.extract_messages(turns),
             "max_tokens": C.LLM_MAX_TOKENS_EXTRACT,
             "temperature": C.LLM_TEMPERATURE,
+            **_NO_THINK,
             **_struct_body(self.struct_mode, JSON_SCHEMA),
         }
         t0 = time.perf_counter()
@@ -115,7 +120,8 @@ class LlmClient:
         body = {"model": self.model,
                 "messages": prompts.ask_messages(document, question, history),
                 "max_tokens": C.LLM_MAX_TOKENS_ASK,
-                "temperature": C.LLM_TEMPERATURE, "stream": True}
+                "temperature": C.LLM_TEMPERATURE, "stream": True,
+                **_NO_THINK}
         parts = []
         async with self.http.stream("POST", "/v1/chat/completions", json=body) as r:
             r.raise_for_status()
@@ -148,7 +154,8 @@ class LlmClient:
     async def explain(self, title, status, reasons, facts=None):
         body = {"model": self.model,
                 "messages": prompts.explain_messages(title, status, reasons, facts),
-                "max_tokens": 220, "temperature": C.LLM_TEMPERATURE}
+                "max_tokens": 220, "temperature": C.LLM_TEMPERATURE,
+                **_NO_THINK}
         r = await self.http.post("/v1/chat/completions", json=body)
         r.raise_for_status()
         text = r.json()["choices"][0]["message"]["content"].strip()
